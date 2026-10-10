@@ -81,6 +81,10 @@ def make_runtime(output: Optional[RecordingMouseOutput] = None, **overrides: Any
         "show_preview": False,
         "start_paused": False,
         "smoothing": 1.0,  # deterministic: the cursor lands exactly on the target
+        # This suite documents the *relative* pipeline (displacement, gain, deadzone accumulation,
+        # re-anchor, the still-hand scroll guard), so it states the mode instead of inheriting it.
+        # Absolute mode - the default since 2026-10-10 - has its own suite in test_pointer_modes.py.
+        "pointer_mode": "relative",
     }
     config_overrides.update(overrides)
     return HandMouseRuntime(

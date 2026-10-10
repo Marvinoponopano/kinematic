@@ -178,9 +178,17 @@ def main(argv: Optional[list] = None) -> int:
     print(
         f"kinematic: sensitivity {runtime.sensitivity:.2f} "
         f"(range {runtime.config.sensitivity_min}-{runtime.config.sensitivity_max}, "
-        f"{runtime.config.sensitivity_step}x per turn)"
+        f"{runtime.config.sensitivity_step}x per turn, reach {runtime.reach:.2f} screens per frame width)"
     )
     print("kinematic: turn the dial with ] (faster) and [ (slower); 0 resets it to where you started")
+    if runtime.sensitivity_clamped_from is not None:
+        print(
+            f"kinematic: requested sensitivity {runtime.sensitivity_clamped_from} is below the reach "
+            f"floor {runtime.config.sensitivity_min} - using {runtime.sensitivity:.2f}; below that the "
+            "screen edges cannot be reached"
+        )
+    if runtime.reach_warning:
+        print(f"kinematic: warning - {runtime.reach_warning}")
     if runtime.paused:
         print("kinematic: paused at startup - press SPACE in the preview window to control the mouse, ESC or q to quit")
     if isinstance(runtime.output, RecordingMouseOutput):

@@ -93,8 +93,17 @@ class HandMouseRuntime:
         self.last_gesture_events: Tuple[GestureEvent, ...] = ()
 
         # The sensitivity dial: `sensitivity_start` is the value the app was launched with, so
-        # the reset key always has somewhere to return to.
-        self.sensitivity_start: float = float(self.config.pointer_sensitivity)
+        # the reset key always has somewhere to return to. The floor is applied *here* as well as
+        # in set_sensitivity(), so a --sensitivity below it cannot slip in through the config and
+        # leave the screen edges unreachable.
+        requested = float(self.config.pointer_sensitivity)
+        self.sensitivity_start: float = clamp(
+            requested, float(self.config.sensitivity_min), float(self.config.sensitivity_max)
+        )
+        self.sensitivity_clamped_from: Optional[float] = (
+            requested if requested != self.sensitivity_start else None
+        )
+        self.config.pointer_sensitivity = self.sensitivity_start
         self.sensitivity_changes: int = 0
 
     # -- construction helpers -------------------------------------------------
@@ -205,25 +214,71 @@ class HandMouseRuntime:
         """Return the dial to the value the app started with."""
         return self.set_sensitivity(self.sensitivity_start)
 
+    @property
+    def reach(self) -> float:
+        """Screen widths the cursor covers per frame width of hand travel.
+
+        Below 1.0 the screen edges cannot be reached, and that is why the dial's floor is 1.0: in
+        absolute mode the mapped region stops covering the whole screen, and in relative mode a
+        single sweep of the frame cannot cross it (it would need several sweeps).
+        """
+        return self.sensitivity
+
+    @property
+    def reach_warning(self) -> Optional[str]:
+        """Set when the current gain leaves the screen edges out of reach.
+
+        Only reachable by deliberately lowering ``sensitivity_min`` (or raising
+        ``sensitivity_reach_floor``); the default floor makes it impossible.
+        """
+        floor = float(self.config.sensitivity_reach_floor)
+        if self.reach >= floor:
+            return None
+        return f"gain {self.sensitivity:.2f} is below the reach floor {floor:g}: the screen edges cannot be reached"
+
+    def apply_reach_gain(self, target: Tuple[float, float]) -> Tuple[float, float]:
+        """Zoom a mapped screen point about the screen centre by the current gain.
+
+        Absolute mode needs this for the dial to mean what it means in relative mode — higher gain
+        means less hand travel for the same cursor travel. At gain 1.0 the mapped region already
+        covers the whole screen, so the gain decides how much of the frame the screen occupies:
+        above 1.0 the hand needs less travel, below 1.0 the reach shrinks inside the screen and the
+        edges become unreachable.
+        """
+        gain = self.sensitivity
+        if gain == 1.0:
+            return target
+        centre_x = self.screen_w / 2.0
+        centre_y = self.screen_h / 2.0
+        return (
+            centre_x + (target[0] - centre_x) * gain,
+            centre_y + (target[1] - centre_y) * gain,
+        )
+
     def sensitivity_bar(self, width: int = 10) -> str:
         """The dial's position as a compact ASCII bar, on a log scale.
 
-        The range spans 0.5 → 60 (a factor of 120), so a linear bar would look nearly empty at
-        the default 5.0. Log scale puts the default ~6 cells in, which is what a dial should
-        feel like: even turns either side of where you are.
+        The range spans 1.0 → 60 (a factor of 60), so a linear bar would show a low setting as
+        nearly empty. Log scale gives even turn sizes. It never draws an empty bar: the floor is
+        still a usable gain, and an empty bar would read as "off".
         """
         low = float(self.config.sensitivity_min)
         high = max(float(self.config.sensitivity_max), low * 1.01)
         value = min(max(self.sensitivity, low), high)
         span = math.log(high) - math.log(low)
         position = 0.0 if span <= 0 else (math.log(max(value, low)) - math.log(low)) / span
-        filled = int(round(position * width))
-        filled = min(max(filled, 0), width)
+        filled = min(max(int(round(position * width)), 1), width)
         return "#" * filled + "-" * (width - filled)
 
     def sensitivity_text(self) -> str:
         """One line describing the dial: its value, its position, and the keys that turn it."""
-        return f"sens {self.sensitivity:5.2f} [{self.sensitivity_bar()}]  ] faster  [ slower  0 reset"
+        text = f"sens {self.sensitivity:5.2f} [{self.sensitivity_bar()}]  ] faster  [ slower  0 reset"
+        warning = self.reach_warning
+        if warning:
+            # Only possible if the floor was lowered by hand; better to say so than to leave the
+            # user wondering why the pointer stops short of the screen edge.
+            text += "  ! edges unreachable"
+        return text
 
     # -- per-frame pipeline ---------------------------------------------------
 
@@ -252,10 +307,12 @@ class HandMouseRuntime:
             (self.screen_w, self.screen_h),
             frame_region=self.frame_region,
             screen_region=self.screen_region,
-            clamp=True,
+            clamp=False,  # the reach gain below must be able to expand past the screen region
         )
+        target = self.apply_reach_gain(target)
         if self.config.pointer_scale != 1.0:
-            # Legacy extra gain, kept for anyone who tuned it; 1.0 is the calibrated value.
+            # Legacy extra gain, kept for anyone who tuned it; 1.0 is the calibrated value. The
+            # dial (pointer_sensitivity) is the knob to use now.
             target = (target[0] * self.config.pointer_scale, target[1] * self.config.pointer_scale)
         target = clamp_point(target, self.screen_w, self.screen_h)
 
@@ -598,6 +655,8 @@ class HandMouseRuntime:
             "loop_fps": round(self.loop_fps, 2),
             "output": type(self.output).__name__,
             "recorded": counts,
+            "pointer_mode": self.config.pointer_mode,
+            "reach": round(self.reach, 4),
             "sensitivity": round(self.sensitivity, 4),
             "sensitivity_start": round(self.sensitivity_start, 4),
             "sensitivity_changes": self.sensitivity_changes,

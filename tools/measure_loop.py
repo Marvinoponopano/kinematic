@@ -19,6 +19,13 @@ which is what the app used to do.
 real key handler, the same path the preview window uses) and reports the mean cursor travel
 before and after, so the dial can be seen working as a number.
 
+`--sweep-reach N` walks the synthetic palm to each corner of the frame region, *holds* it there for
+`--reach-dwell` frames and reports how far the cursor actually got. It reports the two phases
+separately on purpose: a lagging filter cannot hit the extreme *while the hand is still moving*,
+whereas a hand that arrives and stops gets there — and stopping at the edge is what a user does. The
+verdict comes from the dwell phase; the travel shortfall is printed next to it so the lag is visible
+rather than hidden.
+
 Two traps this harness exists to avoid:
 
 * Time the loop from *inside* it. `cv2.destroyAllWindows()` on macOS costs ~1.5 s, which
@@ -33,7 +40,7 @@ import sys
 import time
 from pathlib import Path
 from types import SimpleNamespace
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -52,12 +59,51 @@ class SyntheticHands:
     bug's input, kept here so the fix can be demonstrated on demand.
     """
 
-    def __init__(self, real=None, translate: bool = True, tap_period: int = 30, gesture: str = "left") -> None:
+    #: The four corners of the frame region, as frame coordinates (the region absolute mode maps).
+    REACH_CORNERS: Tuple[Tuple[float, float], ...] = ((0.15, 0.15), (0.85, 0.15), (0.85, 0.85), (0.15, 0.85))
+
+    def __init__(
+        self,
+        real=None,
+        translate: bool = True,
+        tap_period: int = 30,
+        gesture: str = "left",
+        sweep_reach: int = 0,
+        reach_dwell: int = 12,
+    ) -> None:
         self.real = real
         self.translate = translate
         self.tap_period = tap_period
         self.gesture = gesture
+        self.sweep_reach = sweep_reach
+        self.reach_dwell = reach_dwell
+        #: Which phase of the reach sweep this frame belongs to ("travel" | "dwell"), read by the
+        #: reporting code so the two are not averaged into one misleading number.
+        self.reach_phase = "travel"
         self.calls = 0
+
+    def reach_target(self, step: int) -> Tuple[float, float]:
+        """Where the palm should be on this step of the reach sweep, and whether it is dwelling.
+
+        Each leg travels to a corner over ``sweep_reach`` frames and then holds it for
+        ``reach_dwell`` frames, because a hand that stops at the edge is the case that has to reach
+        the edge; a continuously moving hand trails it by the filter's lag.
+        """
+        travel = max(1, self.sweep_reach)
+        leg = travel + max(0, self.reach_dwell)
+        index = (step // leg) % len(self.REACH_CORNERS)
+        within = step % leg
+        corner = self.REACH_CORNERS[index]
+        previous = self.REACH_CORNERS[index - 1] if index > 0 else (0.5, 0.5)
+        if within < travel:
+            self.reach_phase = "travel"
+            progress = (within + 1) / travel
+            return (
+                previous[0] + (corner[0] - previous[0]) * progress,
+                previous[1] + (corner[1] - previous[1]) * progress,
+            )
+        self.reach_phase = "dwell"
+        return corner
 
     @staticmethod
     def _hand(offset, index_drop, pinch_target=None):
@@ -87,12 +133,22 @@ class SyntheticHands:
         points[4] = thumb
         return points
 
+    #: Where the palm centre sits relative to the hand's `base` point in :meth:`_hand`, which the
+    #: reach sweep needs in order to put the palm itself on a chosen frame position.
+    PALM_FROM_BASE = (0.016, -0.026)
+
     def process(self, rgb):
         self.calls += 1
         if self.real is not None:
             self.real(rgb)  # keep paying the real MediaPipe cost
         step = self.calls
-        if self.translate:
+        if self.sweep_reach:
+            # Walk the palm to each corner and hold it there (see reach_target). Both axes use their
+            # own offset because the palm is not centred on the hand's base point.
+            palm = self.reach_target(step)
+            offset = (palm[0] - 0.5 - self.PALM_FROM_BASE[0], palm[1] - 0.6 - self.PALM_FROM_BASE[1])
+            index_drop = 0.0
+        elif self.translate:
             offset = (0.05 * math.sin(step / 10.0), 0.03 * math.cos(step / 13.0))
             index_drop = 0.0
         else:
@@ -170,19 +226,37 @@ def main() -> int:
         default=None,
         help="which dial key to press for --dial-notches; defaults to ']' for positive values and '[' for negative",
     )
+    parser.add_argument(
+        "--sweep-reach",
+        type=int,
+        default=0,
+        help="with --synthetic-hand, walk the palm to each corner of the frame region over N frames, hold it for --reach-dwell, and report how far the cursor got (the absolute-mode reachability check)",
+    )
+    parser.add_argument(
+        "--reach-dwell",
+        type=int,
+        default=12,
+        help="frames to hold the palm at each corner during --sweep-reach (default 12, ~0.4 s: what a user does at an edge)",
+    )
     args = parser.parse_args()
 
     here = pyautogui.position()
     real_move_to = pyautogui.moveTo
     calls = {"move": 0, "click": 0, "scroll": 0}
     travel: List[float] = []  # distance of each requested cursor move, in pixels
-    previous_point: List[Optional[Tuple[float, float]]] = [None]
+    previous_point: List[Tuple[float, float]] = []
+    reached: Dict[str, List[float]] = {"x": [], "y": []}  # every requested coordinate, for the sweep
+    reached_phase: List[str] = []  # "travel" | "dwell", so the two are reported separately
+    phase_of: List[str] = ["travel"]  # set by the synt.*hook below; a list so the closure sees updates
 
     def counted_move_to(x, y, duration=0, **kwargs):
         calls["move"] += 1
-        if previous_point[0] is not None:
+        if previous_point:
             travel.append(math.hypot(x - previous_point[0][0], y - previous_point[0][1]))
-        previous_point[0] = (x, y)
+        previous_point[:] = [(x, y)]
+        reached["x"].append(x)
+        reached["y"].append(y)
+        reached_phase.append(phase_of[0])
         return real_move_to(here.x, here.y, duration=duration, **kwargs)
 
     pyautogui.moveTo = counted_move_to
@@ -210,13 +284,21 @@ def main() -> int:
             real_process,
             translate=not args.fingers_only,
             gesture=args.synthetic_pinch,
+            sweep_reach=args.sweep_reach,
+            reach_dwell=args.reach_dwell,
         )
+        reach_phase_source = app.runtime.hands
         real_process = app.runtime.hands.process
+    else:
+        reach_phase_source = None
 
-    def process(rgb, _real=real_process, _seen=seen, _stamps=stamps):
+    def process(rgb, _real=real_process, _seen=seen, _stamps=stamps, _source=reach_phase_source):
         _seen["n"] += 1
         _stamps.append(time.perf_counter())
-        return _real(rgb)
+        result = _real(rgb)
+        if _source is not None:
+            phase_of[0] = _source.reach_phase  # the sweep sets this as it builds each frame
+        return result
 
     app.runtime.hands.process = process
 
@@ -271,6 +353,43 @@ def main() -> int:
                   f"{mean_after:.1f} px over {len(after)} after "
                   f"({mean_after / mean_before if mean_before else 0:.2f}x)")
     print(f"status           : {app.status}")
+    if args.sweep_reach and reached["x"]:
+        # Sub-pixel tolerance: the cursor filter lands a hair inside the edge (e.g. 1709.9999), which
+        # is the edge as far as the pointer is concerned. The tolerance is the *move guard's* rest
+        # band, not an arbitrary half pixel: `min_move_pixels` deliberately stops emitting once the
+        # remaining distance to the target is under that, so the cursor rests within it of the target.
+        guard = float(getattr(app.config, "min_move_pixels", 0.5) or 0.5)
+        tolerance = max(0.5, guard + 0.5)
+        screen_w, screen_h = app.runtime.screen_w, app.runtime.screen_h
+
+        def extremes(phase: str) -> Optional[Tuple[float, float, float, float]]:
+            xs = [x for x, tag in zip(reached["x"], reached_phase) if tag == phase]
+            ys = [y for y, tag in zip(reached["y"], reached_phase) if tag == phase]
+            if not xs or not ys:
+                return None
+            return min(xs), max(xs), min(ys), max(ys)
+
+        def worse_shortfall(span: Optional[Tuple[float, float, float, float]]) -> float:
+            if span is None:
+                return float("inf")
+            min_x, max_x, min_y, max_y = span
+            return max(min_x, min_y, screen_w - max_x, screen_h - max_y)
+
+        moving, held = extremes("travel"), extremes("dwell")
+        verdict = "all four screen edges reached" if worse_shortfall(held) <= tolerance else "EDGES NOT REACHED"
+        print(f"reach            : screen {screen_w}x{screen_h}, tolerance {tolerance:.1f} px (the move guard's rest band)")
+        if moving is not None:
+            print(
+                f"  hand still moving : x {moving[0]:.1f}..{moving[1]:.1f}, y {moving[2]:.1f}..{moving[3]:.1f}"
+                f"  (worst shortfall {worse_shortfall(moving):.1f} px - the filter's lag while the hand travels)"
+            )
+        if held is not None:
+            print(
+                f"  hand held at edge : x {held[0]:.1f}..{held[1]:.1f}, y {held[2]:.1f}..{held[3]:.1f}"
+                f"  (worst shortfall {worse_shortfall(held):.1f} px) -> {verdict}"
+            )
+        else:
+            print(f"  hand held at edge : no dwell frames recorded -> {verdict}")
     print(f"mouse calls kept away from the OS: {calls}")
     app.close()
     return 0

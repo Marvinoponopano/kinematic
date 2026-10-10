@@ -49,6 +49,10 @@ def make_runtime(output: RecordingMouseOutput, **overrides: Any) -> HandMouseRun
         "start_paused": False,
         "smoothing_mode": "ema",
         "smoothing": 1.0,  # identity filter: the cursor lands exactly where the gain says
+        # The dial is mode-independent (same field, same floor, same keys), but the *travel* it
+        # produces is measured against hand displacement, so the travel tests state relative mode
+        # explicitly. Absolute mode's gain tests live in test_pointer_modes.py.
+        "pointer_mode": "relative",
     }
     config_overrides.update(overrides)
     return HandMouseRuntime(config=HandMouseConfig(**config_overrides), output=output)
@@ -57,9 +61,10 @@ def make_runtime(output: RecordingMouseOutput, **overrides: Any) -> HandMouseRun
 class DialDefaultsTests(unittest.TestCase):
     def test_the_dial_has_a_sensible_range_and_step(self):
         config = HandMouseConfig()
-        self.assertEqual(config.pointer_sensitivity, 5.0)
+        self.assertEqual(config.pointer_sensitivity, 1.0, "the neutral gain: one screen per frame width")
         self.assertEqual(config.sensitivity_step, 1.15)
-        self.assertLess(config.sensitivity_min, config.pointer_sensitivity)
+        self.assertEqual(config.sensitivity_min, 1.0, "the floor: below it the screen edges are unreachable")
+        self.assertEqual(config.sensitivity_reach_floor, 1.0)
         self.assertGreater(config.sensitivity_max, config.pointer_sensitivity)
         self.assertTrue(config.show_sensitivity)
 
@@ -93,6 +98,7 @@ class SetSensitivityTests(unittest.TestCase):
     def test_values_are_clamped_to_the_dial_range(self):
         self.assertEqual(self.runtime.set_sensitivity(0.0), self.runtime.config.sensitivity_min)
         self.assertEqual(self.runtime.set_sensitivity(-5.0), self.runtime.config.sensitivity_min)
+        self.assertEqual(self.runtime.set_sensitivity(0.5), self.runtime.config.sensitivity_min)
         self.assertEqual(self.runtime.set_sensitivity(1e6), self.runtime.config.sensitivity_max)
 
     def test_turning_the_dial_emits_nothing(self):
@@ -182,7 +188,7 @@ class DialChangesCursorTravelTests(unittest.TestCase):
     def test_travel_matches_the_documented_units(self):
         # pointer_sensitivity is "screen widths of cursor travel per frame width of hand travel".
         screen_width = RecordingMouseOutput().screen_size()[0]
-        self.assertAlmostEqual(self.travel(5.0), 0.01 * 5.0 * screen_width, places=6)
+        self.assertAlmostEqual(self.travel(2.5), 0.01 * 2.5 * screen_width, places=6)
 
     def test_turning_the_dial_mid_motion_does_not_rescale_what_is_already_on_screen(self):
         output = RecordingMouseOutput()
@@ -207,12 +213,12 @@ class DialChangesCursorTravelTests(unittest.TestCase):
 
     def test_the_dial_works_while_paused_and_still_emits_nothing(self):
         output = RecordingMouseOutput()
-        runtime = make_runtime(output, start_paused=True)
+        runtime = make_runtime(output, start_paused=True, pointer_sensitivity=2.0)
         runtime.process_landmarks(hand(offset=(0.0, 0.0)), now=0.0)
         runtime.adjust_sensitivity(3)
         runtime.process_landmarks(hand(offset=(0.05, 0.0)), now=0.1)
         self.assertEqual(output.counts(), {"move": 0, "click": 0, "scroll": 0})
-        self.assertGreater(runtime.sensitivity, 5.0, "the dial is configuration, not output")
+        self.assertGreater(runtime.sensitivity, 2.0, "the dial is configuration, not output")
 
 
 class DialKeyTests(unittest.TestCase):
@@ -227,10 +233,13 @@ class DialKeyTests(unittest.TestCase):
             self.assertGreater(self.runtime.sensitivity, before, f"{key!r} should be faster")
 
     def test_the_down_keys_turn_it_down(self):
+        # Start above the floor: the default 1.0 *is* the floor, so there is nowhere below it
+        # (test_pointer_modes.py covers the floor itself).
         for key in ("[", "-", "_"):
-            before = self.runtime.sensitivity
-            self.assertFalse(self.runtime.handle_key(ord(key)))
-            self.assertLess(self.runtime.sensitivity, before, f"{key!r} should be slower")
+            runtime = make_runtime(RecordingMouseOutput(), pointer_sensitivity=3.0)
+            before = runtime.sensitivity
+            self.assertFalse(runtime.handle_key(ord(key)))
+            self.assertLess(runtime.sensitivity, before, f"{key!r} should be slower")
 
     def test_the_reset_key_returns_to_the_starting_value(self):
         runtime = make_runtime(self.output, pointer_sensitivity=9.0)
@@ -277,19 +286,19 @@ class DialReadoutTests(unittest.TestCase):
 
     def test_the_bar_spans_the_range(self):
         self.runtime.set_sensitivity(self.runtime.config.sensitivity_min)
-        self.assertEqual(self.runtime.sensitivity_bar(), "-" * 10)
+        self.assertEqual(self.runtime.sensitivity_bar(), "#" + "-" * 9, "the floor is the first cell")
         self.runtime.set_sensitivity(self.runtime.config.sensitivity_max)
         self.assertEqual(self.runtime.sensitivity_bar(), "#" * 10)
 
-    def test_the_bar_is_log_scaled_so_the_default_sits_in_the_middle(self):
-        # The range 0.5 -> 60 is a factor of 120, so a linear bar would show the default 5.0 as
-        # almost empty. On a log scale 5.0 (a factor of 10 above the bottom) lands on the middle
-        # of a 10-cell bar, and the geometric midpoint (0.5 * sqrt(120) = 5.48) lands on the same cell.
-        self.assertEqual(self.runtime.sensitivity_bar(), "#####-----")
-        self.runtime.set_sensitivity(0.5 * 120 ** 0.5)
+    def test_the_bar_is_log_scaled_and_never_empty(self):
+        # The range 1.0 -> 60 is a factor of 60. It never draws an empty bar: the floor is still a
+        # usable gain and an empty bar would read as "off". Log scale makes turns even, so the
+        # geometric midpoint (sqrt(60) = 7.75) lands on exactly half the bar.
+        self.assertEqual(self.runtime.sensitivity_bar(), "#---------", "the default is the floor")
+        self.runtime.set_sensitivity(60 ** 0.5)
         self.assertEqual(self.runtime.sensitivity_bar(), "#####-----", "the geometric midpoint")
-        self.runtime.set_sensitivity(1.0)
-        self.assertEqual(self.runtime.sensitivity_bar(), "#---------", "one factor of two up")
+        self.runtime.set_sensitivity(5.0)  # the old default, kept as a reference point
+        self.assertEqual(self.runtime.sensitivity_bar(), "####------")
 
     def test_the_bar_is_monotone_and_respects_its_width(self):
         previous = -1
@@ -356,7 +365,7 @@ class DialCommandLineTests(unittest.TestCase):
 
     def test_defaults_are_untouched_without_the_flags(self):
         config = build_config(parse_args([]))
-        self.assertEqual(config.pointer_sensitivity, 5.0)
+        self.assertEqual(config.pointer_sensitivity, 1.0)
         self.assertEqual(config.sensitivity_step, 1.15)
 
     def test_the_app_reports_the_dial_at_startup(self):

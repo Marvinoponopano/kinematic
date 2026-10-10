@@ -49,19 +49,24 @@ class HandMouseConfig:
     # The cursor used to be driven by the index fingertip, so curling or spreading the
     # fingers dragged it across the screen while the hand itself was still. It is now
     # driven by the wrist/palm, which barely moves when the fingers do.
-    pointer_mode: str = "relative"
-    #   "relative" (default): the cursor follows *hand displacement*, like a mouse.
-    #       Finger curl contributes nothing because the palm does not move; rotating
-    #       the wrist or moving nearer to the camera does not move the cursor either.
-    #   "absolute": the cursor maps to the hand's position in the frame (the previous
-    #       behaviour, without the fingertip).
+    pointer_mode: str = "absolute"
+    #   "absolute" (default since 2026-10-10): the cursor maps to the hand's *position* in the
+    #       frame — the inner 70% of the frame covers the whole screen, so every screen edge and
+    #       corner is directly reachable, and the sensitivity dial scales that reach. Moving the
+    #       hand to a comfortable spot therefore moves the cursor with it (no clutch either way).
+    #   "relative": the cursor follows *hand displacement*, like a mouse. Finger curl still
+    #       contributes nothing, but the screen edges can only be reached by accumulating travel
+    #       (repeated sweeps), which is what makes a low gain feel like it "cannot reach the edge".
     pointer_reference: str = "palm"
     #   "palm" (default) = mean of wrist + the four knuckles; "wrist" = wrist joint
     #   only (most stable); "index" = the legacy fingertip, which finger curl moves.
-    pointer_sensitivity: float = 5.0
-    #   relative mode gain: screen widths of cursor travel per frame width of hand
-    #   travel. 5.0 means crossing the screen takes ~20% of the frame's width of hand
-    #   movement. Raise it to make the pointer quicker.
+    pointer_sensitivity: float = 1.0
+    #   The dial's value: screen widths of cursor travel per frame width of hand travel. 1.0 is the
+    #   neutral gain — the whole screen is reachable in one frame width of hand travel (absolute
+    #   mode maps the inner 70% of the frame onto the screen itself; relative mode needs a full
+    #   sweep to cross). It is also the floor: below 1.0 the screen edges are out of reach, so the
+    #   dial cannot go lower unless sensitivity_min is deliberately overridden. Raise it to make
+    #   the pointer quicker — 5.0, the old relative-mode default, is ~20% of the frame per screen.
     pointer_deadzone: float = 0.003
     #   Hand displacement (normalized frame units) treated as jitter and held back.
     #   It accumulates, so slow movement still moves the cursor instead of being lost.
@@ -81,9 +86,15 @@ class HandMouseConfig:
     #   How much one notch of the dial changes pointer_sensitivity: a multiplier, so every
     #   notch feels the same whether you are at 1.0 or 40.0 (a 15% change per press). Use
     #   --sensitivity-step or this field for a finer or coarser dial.
-    sensitivity_min: float = 0.5
-    #   The slow end of the dial. 0.5 needs two frame-widths of hand travel to cross the
-    #   screen — slow, but still usable.
+    sensitivity_min: float = 1.0
+    #   The slow end of the dial, and it is not a taste decision: one full frame width of hand
+    #   travel must cover at least one screen width, or the screen edges cannot be reached —
+    #   in absolute mode the mapped region stops covering the whole screen, and in relative mode a
+    #   single sweep cannot cross it. Lower it only if you know you want the edge of the screen to
+    #   be unreachable; the runtime then warns (reach_warning) instead of failing silently.
+    sensitivity_reach_floor: float = 1.0
+    #   The gain at which the whole screen becomes unreachable ("reach"), reported by
+    #   runtime.reach / runtime.reach_warning. sensitivity_min defaults to it.
     sensitivity_max: float = 60.0
     #   The fast end of the dial: about 1.7% of the frame width crosses the whole screen.
     #   The dial clamps here rather than letting the pointer become uncontrollable.
