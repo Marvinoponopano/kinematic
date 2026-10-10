@@ -47,3 +47,14 @@ def relative_move_delta(previous: Optional[Point], current: Point) -> Point:
 
 def normalize_screen_point(point: Point, width: int, height: int) -> Point:
     return (point[0] * width, point[1] * height)
+
+
+def needs_cursor_update(current: Point, target: Point, min_pixels: float = 0.0) -> bool:
+    """True when moving the cursor from *current* to *target* is worth the call.
+
+    One pyautogui move costs ~11 ms on macOS, so re-issuing a move that cannot shift
+    the cursor by even a fraction of a pixel is pure added latency.
+    """
+    if min_pixels <= 0:
+        return True
+    return point_distance(current, target) >= min_pixels
