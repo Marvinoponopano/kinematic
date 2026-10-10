@@ -7,7 +7,14 @@ class HandMouseConfig:
     camera_index: int = 0
     window_name: str = "Kinematic"
     smoothing: float = 0.35
-    deadzone: float = 0.02
+    deadzone: float = 0.0
+    #   Absolute mode: from 2026-10-10 this is 0 (no freeze) and it is what made the cursor feel
+    #   like it snapped to a grid. A non-zero value holds the palm reference until the hand moves
+    #   that far, and since it is in *frame* units it is large on screen — the old 0.02 was ~49 px
+    #   horizontally, so the cursor sat still and then jumped. Jitter is handled by the cursor
+    #   filter instead (see smoothing_mode), which smooths continuously rather than in steps. Set
+    #   it only if you want the freeze; tools/measure_smoothness.py shows exactly what it costs in
+    #   held frames, jump size and trailing. It is a radius, not a per-axis box, when non-zero.
     click_threshold: float = 0.06
     right_click_threshold: float = 0.08
     scroll_threshold: float = 0.04
@@ -110,19 +117,21 @@ class HandMouseConfig:
 
     # --- Phase 3: smoothing and screen mapping ------------------------------
     smoothing_mode: str = "one_euro"
-    #   "one_euro" (default, changed 2026-10-10) = the 1-euro filter: it beat the previous
-    #   EMA on every axis when measured (tools/compare_smoothing.py, 16 seeds): 25% less
-    #   jitter, a 2-frame instead of 6-frame step response, and far less lag on fast
-    #   movement (151 px vs 529 px at 1.0 landmark-units/s). "ema" restores the old feel.
-    one_euro_min_cutoff: float = 1.0
-    #   One Euro cutoff (Hz) when the hand is still; lower is smoother (0.5 gives ~25% less
-    #   jitter than the default but noticeably more lag on slow movement).
-    one_euro_beta: float = 8.0
-    #   How fast the cutoff opens up with hand speed. Measured: beta=8 dominates the old
-    #   EMA at every speed tested; lower values (1-2) filter harder and trail on slow
-    #   movement. The classic 0.007 default assumes pixel units — landmarks are ~1.0 across.
+    #   "one_euro" (default) = the 1-euro filter. "ema" uses `smoothing` as a fixed factor.
+    one_euro_min_cutoff: float = 4.0
+    #   One Euro cutoff (Hz) when slow/still; lower = smoother but more lag. 4.0 was chosen from
+    #   tools/measure_smoothness.py against both a still hand and slow/fast sweeps: a still hand's
+    #   per-frame cursor step drops from ~7 px (no effective filtering) to ~2.6 px, and a slow sweep
+    #   still follows with ~7 px of trailing. Retune there, not by feel.
+    one_euro_beta: float = 0.0
+    #   How fast the cutoff opens with speed. **0 by design, because beta is in pixel units** and this
+    #   filter is fed *screen pixels*: the paper's 0.007 assumes pixel inputs, and our per-frame px
+    #   deltas are 1-30, so any beta >= 0.1 saturates the cutoff — measured, beta=8.0 gives alpha 0.96
+    #   even at 0.5 px/frame, i.e. the filter was passing landmark noise straight through. That was a
+    #   large part of "the cursor feels stuttery". Raise it only if you know you want the speed term;
+    #   tools/measure_smoothness.py shows what it costs in jitter.
     one_euro_d_cutoff: float = 1.0
-    #   Cutoff (Hz) for the speed estimate itself.
+    #   Cutoff (Hz) for the speed estimate itself (only matters when beta > 0).
     frame_margin: float = 0.15
     #   Absolute mode only: the inner part of the camera frame that maps to the screen
     #   (0.15 keeps the middle 70%), so the screen corners are reachable without moving

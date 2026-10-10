@@ -14,6 +14,10 @@ gesture state machine, cursor, clicks, scroll, pause/runtime, calibration) are d
 [`AGENTS.md`](AGENTS.md) — see §2 "Phase status" for what is actually implemented today. Phases 1–4
 are complete.
 
+The pointer path is tuned by measurement rather than by feel: **256 tests**, and
+`python3 tools/measure_smoothness.py` reports how often the cursor holds still, how large each step is
+and how far it trails your hand — no camera or mouse required.
+
 ## Features
 - Cursor control from the wrist/palm (finger articulation cannot move the pointer)
 - Left click on a thumb–index pinch, right click on a thumb–middle pinch
@@ -67,20 +71,35 @@ preview window's keyboard. No restart, no config file, no UI:
 | `[` or `-` or `_` | one notch **slower** |
 | `0` | back to the value you started with |
 
-The current setting is drawn on the preview — `sens  5.00 [#####-----]  ] faster  [ slower  0 reset` —
+The current setting is drawn on the preview — `sens  1.00 [#---------]  ] faster  [ slower  0 reset` —
 as the value plus a log-scale bar (each notch is ×1.15, so the bar moves evenly wherever you are). The
-range is 0.5 (very slow) to 60 (very fast) and it clamps at the ends rather than wrapping.
+range is 1.0 to 60, and it clamps at the ends rather than wrapping.
+
+**Why 1.0 is the bottom: the screen has to stay reachable.** The gain means *screen widths of cursor
+travel per frame width of hand travel*, so below 1.0 a full sweep of the hand cannot cover the screen,
+and a strip along each edge becomes unreachable. That is the band you may have noticed after turning the
+sensitivity down — it is arithmetic, not a feel. The dial therefore stops at 1.0
+(`sensitivity_min` = `sensitivity_reach_floor`), a starting `--sensitivity` below it is clamped with a
+note in the banner, and if you override the floor deliberately the preview appends
+`! edges unreachable` instead of leaving you guessing.
 
 ```bash
-python3 -m kinematic.main --sensitivity 8          # start faster than the default 5.0
+python3 -m kinematic.main --sensitivity 3          # start faster than the default 1.0
 python3 -m kinematic.main --sensitivity-step 1.3   # coarser dial: 30% per notch
 ```
 
-`pointer_sensitivity` means *screen widths of cursor travel per frame width of hand travel*: at the
-default 5.0, moving your hand across 20% of the frame crosses the screen once. Tune it in the moment
-until pointing feels right — turning the dial never moves the cursor by itself and never makes it jump,
-and the value you end up at is printed when the app exits (pass `--sensitivity` to start a later
-session at the same place).
+In the default absolute mode, 1.0 maps the inner 70% of the frame onto the whole screen, so the screen
+corners are reachable by moving your hand to that region's corners; the dial scales that reach. In
+relative mode the gain scales hand displacement, and reaching both edges needs a little more than 1.0
+(measured ~1.5 in a single sweep) because the return sweep drags the cursor back. Either way, turning the
+dial never moves the cursor by itself and never makes it jump, and the value you end up at is printed
+when the app exits (pass `--sensitivity` to start a later session at the same place).
+
+To check reachability for yourself:
+`python3 tools/measure_loop.py --synthetic-hand --active --sweep-reach 30 --reach-dwell 12` walks a
+synthetic hand to each corner, *stops* there for 12 frames (the way you do when you point at a corner)
+and reports whether all four screen edges were reached — separately from the few px a smooth filter
+trails while the hand is still travelling.
 
 ## Gestures
 
@@ -126,40 +145,54 @@ preferred it. It has no hold time or hysteresis.
 
 Two knobs decide how the pointer *feels*:
 
-- **Smoothing** (`smoothing_mode`, default `one_euro`): the 1-euro filter adapts its cutoff to hand speed —
-  heavy smoothing when your hand is still, almost none when it moves. It replaced a fixed-factor EMA after
-  a seeded comparison (`tools/compare_smoothing.py`, 16 seeds) showed it with 25% less jitter, a 2-frame
-  instead of 6-frame step response, and 151 px instead of 529 px of lag during fast movement.
-  `--smoothing-mode ema` restores the old filter if you prefer its feel.
+- **Smoothing** (`smoothing_mode`, default `one_euro`, `one_euro_min_cutoff` 4.0, `one_euro_beta` 0.0): a
+  4 Hz low-pass on the cursor position, which is what turns noisy, quantised landmarks into a smooth
+  path. `--smoothing-mode ema` uses the older fixed-factor filter instead.
+  - The tuning is measured, not tasteful: see `tools/measure_smoothness.py` (no camera, no mouse needed),
+    which reports how often the cursor *holds* still, how big each emitted step is, and how far it trails
+    your hand. The defaults put a still hand's step at ~2.6 px and free of held frames on a slow sweep.
+  - `one_euro_beta` is 0 on purpose. One Euro's speed term is defined in pixel units, and the cursor is
+    fed screen pixels: the old `beta=8` saturated the cutoff (alpha 0.96 even at 0.5 px/frame) and
+    **switched the filter off entirely**, which is a large part of why the pointer used to feel stuttery.
+    Raising `beta` above ~0.1 brings that behaviour back.
+  - Heavier smoothing (lower `min_cutoff`, e.g. 1-2) is calmer at rest but trails your hand by 20-40 px on
+    slow movement; lighter (8+) is more responsive and shakier. `tools/measure_smoothness.py --min-cutoff
+    N` prints the trade-off for any setting.
+  - A tween on each `pyautogui` move is **not** an option: it only interpolates above 0.1 s, and that
+    blocks the loop for ~171 ms per move (5 frame intervals) — see AGENTS.md gotcha 8.12.
 - **Reach** (`frame_margin`, default 0.15, absolute mode only): the inner 70% of the camera frame maps onto
   the whole screen, so the screen corners are reachable without moving your hand to the edge of the frame.
   `screen_margin` keeps a margin free at the screen edges instead.
+- **`deadzone`** (default **0.0**, absolute mode): set it above 0 and the cursor *holds still* until your
+  hand moves that far (in frame units — 0.02 is ~50 px of screen), then jumps. That hold-then-jump is
+  exactly the "snapping to a grid" feel, so it is off; jitter is the filter's job instead. It is a radius,
+  not a per-axis box.
 
 ## Pointing
 
-The cursor is driven by your **wrist/palm**, not your fingertip, and by default it moves *relative* to
-your hand — like a mouse rather than a laser pointer:
+The cursor is driven by your **wrist/palm**, not your fingertip, and by default it follows the hand's
+**position in the frame** — the inner 70% of the frame covers the whole screen, so every screen edge and
+corner is directly reachable:
 
-- **Move your hand** → the cursor moves. Deliberate hand travel of about 20% of the frame's width crosses
-  the screen once.
+- **Move your hand** → the cursor goes to the matching spot on the screen, corner to corner.
 - **Curl or spread your fingers, pinch, or rotate your wrist** → the cursor does not move at all. Fingers
-  only ever produce gestures (pinch = click, index-finger sweep while the hand holds still = scroll).
-- **Move your hand back to a comfortable position** → the cursor moves back too, so there is no "lift and
-  reposition" clutch yet. If you would rather point at a spot and have the cursor stay there, use
-  position mapping:
+  only ever produce gestures (pinch = click, two-finger pinch = scroll).
+- **Move your hand to a comfortable position** → the cursor goes there too. There is no clutch in either
+  mode, so if you would rather have the cursor move *by displacement* like a mouse (where you can lift
+  and reposition, and the return stroke drags the cursor back), use:
 
 ```bash
-python3 -m kinematic.main --pointer-mode absolute      # cursor maps to where your hand is in the frame
+python3 -m kinematic.main --pointer-mode relative      # cursor moves by hand displacement (mouse-like)
 python3 -m kinematic.main --pointer-reference wrist    # the wrist joint alone (even more stable than the palm)
 python3 -m kinematic.main --pointer-reference index    # the old fingertip behaviour (fingers drag the cursor)
 python3 -m kinematic.main --smoothing-mode ema         # the fixed-factor filter instead of the 1-euro filter
 ```
 
-Which hand point is used, how fast the pointer moves and how much hand jitter is ignored are all fields on
-`HandMouseConfig` (`pointer_reference`, `pointer_sensitivity`, `pointer_deadzone`,
-`relative_scale_by_hand`). `pointer_deadzone` is worth tuning for your own hands and camera:
-`python3 tools/measure_stability.py --seconds 15` reports the per-frame wrist/palm jitter in your setup
-next to the configured deadzone (it only reads landmarks — it cannot move your mouse). How far the
+Which hand point is used, how far the reach extends and how much hand jitter is ignored are all fields on
+`HandMouseConfig` (`pointer_reference`, `pointer_sensitivity`, `frame_margin`, `deadzone`,
+`pointer_deadzone`, `relative_scale_by_hand`). `pointer_deadzone` is worth tuning for your own hands and
+camera: `python3 tools/measure_stability.py --seconds 15` reports the per-frame wrist/palm jitter in your
+setup next to the configured deadzone (it only reads landmarks — it cannot move your mouse). How far the
 cursor travels per unit of hand movement is on the dial — see [Sensitivity](#sensitivity--the-dial)
 above, or set `pointer_sensitivity` directly.
 
@@ -200,12 +233,16 @@ on `HandMouseConfig`, so it can be tuned without touching the loop:
 | `preview_scale` | `0.5` | preview size as a fraction of the frame (1.0 = full size) |
 | `show_preview` | `True` | `False` drops the ~14 ms display cost (then quit with Ctrl-C, not `q`) |
 | `show_fps` | `True` | draw the loop rate on the preview |
-| `smoothing` | `0.35` | EMA factor; raise it for a snappier pointer, lower it for less jitter |
-| `pointer_sensitivity` | `5.0` | cursor travel per unit of hand travel — the dial's value (see above) |
+| `smoothing` | `0.35` | EMA factor, used only with `--smoothing-mode ema`; raise it for a snappier pointer, lower it for less jitter |
+| `one_euro_min_cutoff` | `4.0` | the cursor filter's cutoff (Hz): lower is smoother and trails more |
+| `one_euro_beta` | `0.0` | One Euro speed term, in pixel units — above ~0.1 it saturates the cutoff and disables smoothing |
+| `pointer_sensitivity` | `1.0` | the dial's gain: cursor travel per unit of hand travel (the floor is 1.0) |
 | `sensitivity_step` | `1.15` | how much one notch of the dial changes it, as a multiplier |
-| `sensitivity_min` / `sensitivity_max` | `0.5` / `60.0` | the ends of the dial; the value clamps here |
+| `sensitivity_min` / `sensitivity_max` | `1.0` / `60.0` | the ends of the dial; the floor keeps the screen reachable |
+| `sensitivity_reach_floor` | `1.0` | the gain below which the screen edges cannot be reached |
 | `sensitivity_keys_up` / `_down` / `_reset` | `= + ]` / `- _ [` / `0` | which keys turn the dial |
 | `show_sensitivity` | `True` | draw the dial's value and bar on the preview |
+| `pointer_mode` | `"absolute"` | `absolute` maps the hand's position to the screen; `relative` moves by displacement |
 | `capture_width` / `capture_height` / `capture_fps` / `capture_buffer_size` | 1280 / 720 / 30 / 1 | what is requested from the camera |
 
 ## Requirements
@@ -236,7 +273,7 @@ move.
 python3 -m unittest discover -s tests
 ```
 
-Run from the repository root (the tests import `kinematic.gesture`). **222 tests**, none of which can
+Run from the repository root (the tests import `kinematic.gesture`). **256 tests**, none of which can
 touch your mouse, camera or display: they inject a recording output adapter, fake landmarks and fake
 timestamps. They cover the pure gesture geometry, the capture/control loop, the Phase 1 safety layer
 (paused startup, no output while paused, adapters, keys), the landmark conversion and preview drawing,

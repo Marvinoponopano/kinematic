@@ -57,12 +57,14 @@ kinematic/
     ├── test_phase4_recognizer.py # 54 cases: transitions, hysteresis, hold/cooldown/re-arm, priority, scroll
     ├── test_phase4_runtime.py    # 18 cases: the recogniser wired in, the pause gate, the legacy engine
     ├── test_sensitivity_dial.py  # 38 cases: the pointer-gain dial, its keys, its bar, its wiring
+    ├── test_pointer_modes.py     # 21 cases: absolute is the default, every edge reachable, the reach floor
     └── test_pointer_reference.py # 21 cases: wrist/palm reference, curl must not move the cursor, scroll guard
 tools/
 ├── compare_smoothing.py         # seeded jitter-vs-lag comparison of the cursor filters
 ├── gesture_trace.py             # scripted poses through the recogniser: transition table, no camera
 ├── measure_loop.py              # measure the loop rate with the mouse intercepted (nothing moves)
-└── measure_stability.py         # per-frame wrist/palm jitter vs pointer_deadzone (no output adapter at all)
+├── measure_stability.py         # per-frame wrist/palm jitter vs pointer_deadzone (no output adapter at all)
+└── measure_smoothness.py        # held frames / step size / trailing of the emitted cursor (no camera, no mouse)
 ```
 
 Git: published as a private repo, `origin` = `github.com/Marvinoponopano/kinematic`, branch `main`.
@@ -81,13 +83,18 @@ python3 -m kinematic.main --pointer-mode absolute      # old position-mapped poi
 python3 -m kinematic.main --smoothing-mode ema         # the pre-Phase-3 fixed-factor filter
 python3 -m kinematic.main --gesture-engine legacy      # the pre-Phase-4 inline pinch/scroll tests
 python3 -m kinematic.main --sensitivity 8              # start the pointer gain somewhere else (dial: ] / [ / 0)
-python3 -m unittest discover -s tests       # 222 tests, all pass
+python3 -m kinematic.main --pointer-mode relative      # the old displacement-based scheme (edges need a sweep)
+python3 -m unittest discover -s tests       # 256 tests, all pass
 python3 tools/compare_smoothing.py          # seeded jitter vs lag table for the cursor filters
 python3 tools/gesture_trace.py              # every scripted pose through the recogniser, transition by transition
 python3 tools/measure_loop.py --synthetic-hand --active --fingers-only   # the finger-curl regression demo
 python3 tools/measure_loop.py --synthetic-hand --active --synthetic-pinch two_finger   # the scroll pose in the real loop
 python3 tools/measure_loop.py --synthetic-hand --active --dial-notches 6  # turn the dial and measure the travel change
+python3 tools/measure_loop.py --synthetic-hand --active --sweep-reach 30 --reach-dwell 12  # do all four edges get reached?
 python3 tools/measure_stability.py --seconds 15          # tune pointer_deadzone against your own hand
+python3 tools/measure_smoothness.py                      # held frames / step size / trailing, no camera at all
+python3 tools/measure_smoothness.py --sweep               # the deadzone x filter grid this tuning came from
+python3 tools/measure_smoothness.py --min-cutoff 2 --one-euro-beta 8   # feel the trade-offs yourself
 ```
 
 ### Verified interpreter / dependency facts
@@ -182,57 +189,158 @@ pixels at 1710 px and `pointer_sensitivity` 5.0):
 | `ema` 0.50 | 0.00336 | 4 frames | 71 px | 285 px |
 | `one_euro` min 1.0, beta 0.0 | 0.00179 | 13 frames | 340 px | 1360 px |
 | `one_euro` min 1.0, beta 2.0 | 0.00185 | 2 frames | 227 px | 454 px |
-| **`one_euro` min 1.0, beta 8.0 (new default)** | **0.00201** | **2 frames** | **113 px** | **151 px** |
+| `one_euro` min 1.0, beta 8.0 (then the default) | 0.00201 | 2 frames | 113 px | 151 px |
 | `one_euro` min 2.0, beta 6.0 | 0.00254 | 2 frames | 97 px | 170 px |
 
-Only `min=1.0 beta=8.0` and `min=2.0 beta=6.0` are Pareto-better than the old EMA (less jitter *and*
-no more lag at either speed); beta=8 wins on jitter and on the fast-motion case that matters most in
-relative mode (151 px vs 529 px of trailing). Hence `smoothing_mode="one_euro"`, `one_euro_beta=8.0`.
-`--smoothing-mode ema` restores the previous feel for anyone who preferred it.
+> **Superseded for the default mode (2026-10-10).** That table's filter input is in *landmark* units,
+> which is not what the runtime feeds it: the runtime smooths **screen pixel** positions, and One Euro's
+> `beta` is a pixel-unit constant. In pixel units `beta=8.0` saturates the cutoff and the filter stops
+> filtering (measured: alpha 0.96 even at 0.5 px/frame), so `one_euro_beta` is now **0.0** and
+> `one_euro_min_cutoff` is **4.0** — see "Smoothness: the stutter, found and fixed" below, which has the
+> pixel-unit measurements. The old numbers still describe relative mode's filter *input* correctly.
 
 Tracking loss now resets the filter (`cursor_filter.reset()`), which is the phase's last requirement:
 after a lost-and-reacquired hand the next sample passes straight through, so the cursor neither glides
 from stale state nor keeps drifting on a hand that is no longer moving.
 
-### Pointer reference (fixed 2026-10-10)
+### Smoothness: the stutter, found and fixed (2026-10-10)
+
+Reported as "the mouse feels very stuttery, like it is snapping to a grid". Two independent causes, both
+in the pointer path, and both measured before and after with `tools/measure_smoothness.py` (a seeded
+synthetic hand, no camera, no mouse; `still` / `slow` / `fast` are straight palm paths of 90 frames at
+30 fps with ±0.002 landmark jitter, the same jitter `tools/measure_stability.py` reports for a real hand):
+
+| Configuration | Path | moves / held | step mean | step max | step CV | trailing |
+| --- | --- | --- | --- | --- | --- | --- |
+| **before** (`deadzone=0.02`, filter `beta=8` — effectively off) | still | 1 / 89 | 0.0 | 0.0 | 0.00 | 1.3 px |
+| | slow | **10 / 80** | 64.6 | 77.2 | 0.10 | **480.5 px** |
+| | fast | 19 / 71 | 64.6 | 77.2 | 0.10 | 648.5 px |
+| **after** (`deadzone=0.0`, filter `min_cutoff=4.0 beta=0.0`) | still | 88 / 2 | **2.6** | 7.1 | 0.65 | 2.0 px |
+| | slow | **90 / 0** | 6.2 | 12.1 | 0.49 | 7.1 px |
+| | fast | 90 / 0 | 12.4 | 18.2 | 0.25 | 14.4 px |
+
+1. **The absolute-mode deadzone froze the reference.** `deadzone` is in *frame* units, so the inherited
+   0.02 held the palm reference until the hand had moved ~49 px of screen and then jumped: on a slow
+   sweep, 80 of 90 frames held the cursor still and each update was a ~65 px jump. That is the grid.
+   `deadzone=0.0` is now the default, a non-zero value is a **radius** rather than a per-axis box (a box
+   pins slow *diagonal* movement to the grid), and jitter is left to the filter, which smooths
+   continuously instead of in steps. Non-zero is still available and measured — `0.02` now costs 20 held
+   frames, 31 px jumps, CV 1.04 and **+39 px of trailing** on the slow path.
+2. **The One Euro filter was effectively switched off.** `beta` is a *pixel-unit* parameter (the paper's
+   default is 0.007 for pixel coordinates), but the filter is fed screen-pixel positions whose per-frame
+   deltas are 1-30 — so `beta=8.0` gave `alpha≈0.96` even at 0.5 px/frame, passing landmark noise and
+   quantisation straight to the cursor. Measured on a still hand: **7.2 px mean step with beta=8 vs 2.6 px
+   with beta=0** (see `tools/measure_smoothness.py --one-euro-beta`). The tuning is now a plain 4 Hz
+   low-pass (`min_cutoff=4.0`, `beta=0.0`), chosen from the grid over `min_cutoff` × `beta`: 4 Hz keeps
+   the trailing at ~7 px slow / ~14 px fast while cutting the still-hand shimmer by ~3×. Lower cutoffs
+   (1-2 Hz) are smoother still but trail 21-42 px; higher ones (8 Hz) come back to ~6 px of shimmer.
+3. **pyautogui's own tween is not an option here** (investigated, rejected, and now documented so nobody
+   re-tries it): it only tweens above `MINIMUM_DURATION = 0.1 s`, and a 0.11 s tween measured **171 ms
+   per move** (5.2 camera frame intervals) with its sleep floored at `MINIMUM_SLEEP = 0.05 s`. Below
+   0.1 s it teleports regardless (0.2-0.7 ms). So there is no usable per-frame tween; the smoothness has
+   to come from the filter and the reference. `MouseEvent.duration` records what each move was asked for
+   (always 0) so that stays explicit.
+
+**Reach is unaffected where it matters.** The `--sweep-reach` harness now travels to each corner, holds
+it for `--reach-dwell` frames (12, ~0.4 s — what a user does at an edge) and reports the two phases
+separately, because a lagging filter cannot hit an extreme *while the hand is still moving*:
+
+| Mode | Phase | Cursor span | Worst shortfall | Verdict |
+| --- | --- | --- | --- | --- |
+| `absolute` (default) | hand still moving | x 26.0…1710.0, y 0.0…1112.0 | 26.0 px | the filter's lag while travelling |
+| `absolute` (default) | hand held at edge | x 0.9…1710.0, y 0.0…1112.0 | **0.9 px** | **all four edges reached** |
+| `relative` | hand held at edge | — | — | never reached: a hand that stops moves a relative cursor nowhere |
+
+The tolerance is `min_move_pixels + 0.5` rather than an arbitrary half pixel, because the move guard
+deliberately stops emitting inside that band; at 0.9 px the cursor is on the edge as far as the pointer
+is concerned. `python3 tools/measure_loop.py --synthetic-hand --active --sweep-reach 30 --reach-dwell 12`
+reproduces the table. The absolute-mode tuning also leaves the loop rate alone: 29.93 fps measured
+internally on the real camera with the mouse intercepted, the same as before the change.
+
+**Also verified after the change:** the finger-curl drift fix still holds — with the synthetic hand
+parked and only the fingers moving, the same **11** moves arrive over 120 frames and over 240 frames
+(they are the one-time settle of the cursor onto the hand's mapped position, which the smoother filter
+now spreads over ~11 frames instead of one jump), then the guard emits nothing.
+
+### Pointer reference and control scheme (2026-10-10)
 
 The cursor used to be mapped from the **index fingertip**, so any finger articulation dragged it across
 the screen even when the hand did not move. It is now driven by the **wrist/palm**, which barely moves
-when the fingers do, and in `relative` mode it moves only by *hand displacement* — so finger curl, wrist
-rotation and changing distance from the camera all leave the cursor where it is.
+when the fingers do, in either control scheme.
+
+**The default scheme is `absolute`** (changed 2026-10-10): the cursor maps to the hand's *position* in
+the frame, with the inner 70% of the frame covering the whole screen. The reason is reachability —
+absolute pointing puts every screen edge and corner directly in reach, whereas relative pointing can
+only get there by accumulating travel, which is what makes a low gain feel like it "cannot reach the
+edge" (see "Reach and the sensitivity floor" below for the measurement).
 
 | Config field | Default | Meaning |
 | --- | --- | --- |
-| `pointer_mode` | `"relative"` | `relative`: the cursor is shifted by how far the hand moved (like a mouse). `absolute`: the cursor maps to the hand's position in the frame |
+| `pointer_mode` | `"absolute"` | `absolute`: the cursor maps to the hand's position in the frame — every edge reachable. `relative`: the cursor is shifted by how far the hand moved (like a mouse); the edges need accumulated travel |
 | `pointer_reference` | `"palm"` | `palm` = mean of wrist + the four knuckles; `wrist` = the wrist joint alone (most stable); `index` = the old fingertip behaviour |
-| `pointer_sensitivity` | `5.0` | relative gain: screen widths of cursor travel per frame width of hand travel (5.0 ⇒ crossing the screen takes ~20% of the frame width of hand movement) |
-| `pointer_deadzone` | `0.003` | hand displacement below this is treated as jitter and held back (it accumulates, so slow movement is not lost) |
+| `pointer_sensitivity` | `1.0` | the dial's gain: screen widths of cursor travel per frame width of hand travel. In absolute mode it scales the mapped reach about the screen centre; in relative mode it multiplies the displacement. 1.0 is the neutral gain and the floor |
+| `pointer_deadzone` | `0.003` | hand displacement below this is treated as jitter and held back (it accumulates, so slow movement is not lost) — relative mode |
+| `deadzone` | `0.0` | absolute mode: the palm reference is held until the hand moves this far (a **radius**, in frame units — `0.02` is ~49 px of screen). **0 since 2026-10-10**: a non-zero value is the hold-then-jump grid the user reported — see "Smoothness: the stutter, found and fixed" |
+| `one_euro_min_cutoff` / `one_euro_beta` | `4.0` / `0.0` | the cursor filter, in **screen-pixel** units: a 4 Hz low-pass, no speed term (`beta>0` saturates the cutoff at pixel speeds and stops filtering) |
 | `relative_scale_by_hand` | `False` | divide displacement by apparent hand size, so the feel does not change as you move nearer/further from the camera |
-| `scroll_requires_still_hand` | `True` | index-finger scrolling only acts while the hand holds still, so pointing cannot scroll the page |
+| `scroll_requires_still_hand` | `True` | (legacy engine) index-finger scrolling only acts while the hand holds still |
 
-Measured with `tools/measure_loop.py` (real camera, real MediaPipe, mouse calls intercepted), synthetic
-hand parked with only the index finger moving — the reported bug's input:
-
-| Reference | Cursor moves per 120 frames |
-| --- | --- |
-| `palm` (default) | **0** |
-| `wrist` | **0** |
-| `index` (what the app used to do) | **105** |
-
-And with the whole hand sweeping, the `palm` reference produces 95 moves — the cursor follows deliberate
-hand movement.
+The fingertip-fix evidence is unchanged — with a parked hand and only the index finger moving, the palm
+and wrist references move the cursor **0** times over 120 frames while `index` moves it **105** times —
+and the absolute-mode test suite asserts the same property for the new default
+(`test_finger_curl_does_not_move_the_cursor_in_absolute_mode`).
 
 Known trade-offs, stated plainly:
 
-- **Relative mode drifts and has no clutch.** Moving the hand back to a comfortable position moves the
-  cursor back with it. `pointer_mode="absolute"` avoids that but needs the frame-to-screen mapping
-  calibrated (still a Phase 3/9 job), and re-anchors nothing.
+- **Absolute mode follows the hand's position, so moving your hand to a comfortable spot moves the
+  cursor with it.** There is no clutch in either mode: `relative` drifts back when you return your hand,
+  `absolute` jumps to wherever the hand is (including when the hand is reacquired after a tracking loss,
+  which is inherent to absolute pointing rather than a bug).
 - **`pointer_deadzone` is a guess until measured against a real hand.** `tools/measure_stability.py`
   reports the per-frame jitter of the wrist/palm in your setup next to the configured deadzone; tune the
   field so it sits above that jitter and below deliberate movement.
-- **MediaPipe gives no separate "hand moved" signal.** The displacement used for the scroll guard is the
-  same measured wrist/palm delta, so a slow deliberate translation below the deadzone still reads as
-  "still".
+- **Smoothing is fixed at startup and does not scale with the dial.** The filter's cutoff is constant, so
+  turning `pointer_sensitivity` up multiplies the landmark noise that reaches the screen — at gain 5 a
+  still hand's per-frame step is ~5× the ~2.6 px measured at gain 1.0. A gain-aware cutoff (or a
+  screen-pixel move guard that scales with the gain) is the fix; until then, high gains are visibly
+  shakier than the default.
+- **MediaPipe gives no separate "hand moved" signal.** The displacement used by the legacy scroll guard
+  is the same measured wrist/palm delta, so a slow deliberate translation below the deadzone still reads
+  as "still".
+
+### Reach and the sensitivity floor (added 2026-10-10)
+
+Reported problem: turning the sensitivity down far enough left a band at the screen edges the cursor
+could not enter. The cause is arithmetic. `pointer_sensitivity` is *screen widths of cursor travel per
+frame width of hand travel*, so a gain below 1.0 cannot cover the screen:
+
+- **absolute mode**: the gain zooms the mapped region about the screen centre
+  (`runtime.apply_reach_gain()`), so below 1.0 the region shrinks inside the screen and a strip at every
+  edge is unreachable — measured below.
+- **relative mode**: each sweep of the hand moves the cursor `0.70 × gain` screen widths, and the return
+  sweep drags it back, so a low gain leaves an accumulating shortfall at the edges.
+
+So the floor is not a taste knob. `sensitivity_min` (and `sensitivity_reach_floor`, which it defaults
+to) is **1.0**, the gain at which one frame width of hand travel covers one screen width, and the dial
+cannot be turned below it. `runtime.reach` reports the current reach and `runtime.reach_warning` says so
+in words if the floor is overridden by hand; the HUD appends `! edges unreachable` in that case.
+
+**Measured** with `python3 tools/measure_loop.py --synthetic-hand --active --sweep-reach 60` (real
+camera, real MediaPipe, mouse intercepted; the synthetic palm is walked corner to corner across the
+frame region, so the cursor must reach all four edges):
+
+| Mode | Gain | Cursor x range | Cursor y range | Verdict |
+| --- | --- | --- | --- | --- |
+| `absolute` (default) | 1.0 | 0.1 … 1710.0 | 0.1 … 1112.0 | **all four edges reached** |
+| `absolute` | 3.0 | 0.1 … 1710.0 | 0.1 … 1112.0 | **all four edges reached** |
+| `absolute` | 8.0 | 0.1 … 1710.0 | 0.1 … 1112.0 | **all four edges reached** |
+| `relative` | 1.0 (the floor) | 511.5 … 1710.0 | 316.9 … 1096.8 | **edges NOT reached** |
+| `relative` | 1.5 – 5.0 | 0.1 … 1710.0 | 0.1 … 1112.0 | all four edges reached |
+
+(Screen is the real 1710 × 1112 of this machine; the 0.1 is the cursor filter landing a hair inside the
+edge.) So the floor guarantees the reach in the default absolute mode, and in relative mode it removes
+the worst case but does not by itself guarantee a single sweep spans the screen — relative mode needs
+about 1.5 for this sweep, which is another reason absolute is the default.
 
 ### Performance (measured 2026-10-10)
 
@@ -331,36 +439,42 @@ restart, no config editing, no UI:
 | `[` `-` `_` | one notch slower (`÷ sensitivity_step`) |
 | `0` | back to the value the app started with |
 
-The dial is drawn on the preview as a value plus a log-scale bar, e.g. `sens  5.00 [#####-----]  ]
+The dial is drawn on the preview as a value plus a log-scale bar, e.g. `sens  1.00 [#---------]  ]
 faster  [ slower  0 reset`, and the startup banner repeats it. All the fields are on
 `HandMouseConfig`: `sensitivity_step` (1.15 per notch — multiplicative, so one turn feels the same at
-either end), `sensitivity_min` / `sensitivity_max` (0.5 → 60, clamped rather than wrapped), the three
-key tuples, and `show_sensitivity` for the overlay.
+either end), `sensitivity_min` / `sensitivity_max` (1.0 → 60 — the floor is the reach requirement, see
+"Reach and the sensitivity floor"; the bar never draws empty because the floor is still a usable gain),
+`sensitivity_reach_floor` (what the floor means), the three key tuples, and `show_sensitivity` for the
+overlay. If the floor is overridden by hand, the HUD appends `! edges unreachable` and the banner prints
+the warning, rather than leaving the user to wonder why the pointer stops short of an edge.
 
 Programmatic equivalents, for scripts and for anyone driving the app without the window:
-`runtime.sensitivity` (read), `runtime.set_sensitivity(value)` (clamped), `runtime.adjust_sensitivity(n)`
-and `runtime.reset_sensitivity()`. `runtime.summary()` reports the value the session *ended* at, the
-value it started at, and how many times the dial moved.
+`runtime.sensitivity` (read), `runtime.set_sensitivity(value)` (clamped), `runtime.adjust_sensitivity(n)`,
+`runtime.reset_sensitivity()`, `runtime.reach` and `runtime.reach_warning`. `runtime.summary()` reports
+the mode, the reach, the value the session *ended* at, the value it started at, and how many times the
+dial moved.
 
-Why it is safe to turn mid-gesture: the gain multiplies each frame's *hand displacement* before it is
-added to the cursor position (`pointer_target()`), so changing it cannot rescale movement that is
+Why it is safe to turn mid-gesture: the gain multiplies each frame's *hand displacement* (relative) or
+zooms the mapped point about the screen centre (absolute), so changing it cannot rescale movement that is
 already on screen — the cursor does not jump, and turning the dial emits nothing.
 
-**Evidence** — `tools/measure_loop.py` turns the dial through the real key handler halfway through a run
-with the mouse intercepted, then reports the mean cursor travel before and after (160 frames each,
-~30 fps):
+**Evidence** — `tools/measure_loop.py` turns the dial through the real key handler halfway through a
+relative-mode run with the mouse intercepted, then reports the mean cursor travel before and after (160
+frames each, ~30 fps; `--pointer-mode relative` because that is where travel-per-displacement is the
+thing being measured):
 
 | Command | Sensitivity | Mean cursor travel |
 | --- | --- | --- |
-| `--dial-notches 6` | 5.000 → **11.565** (2.31×) | 35.2 px → **72.8 px** (2.07×) |
-| `--dial-notches -6` | 5.000 → **2.162** (0.43×) | 35.2 px → **15.4 px** (0.44×) |
-| `--sensitivity 20 --dial-notches -10` | 20.000 → **4.944** (0.25×) | 106.1 px → **35.2 px** (0.33×) |
+| `--pointer-mode relative --dial-notches 6` | 1.000 → **2.313** (2.31×) | 7.0 px → **16.4 px** (2.34×) |
+| `--pointer-mode relative --sensitivity 20 --dial-notches -10` | 20.000 → **4.944** (0.25×) | 116.9 px → **35.2 px** (0.30×) |
+| `--sweep-reach 60 --dial-notches 6` (absolute) | 1.000 → **2.313** | reach stays **all four screen edges reached** |
 
 The travel figures track the gain closely but not exactly: the synthetic hand translates
 sinusoidally, so the frames before and after the turn cover different parts of its sweep (and moves
 under `min_move_pixels` are skipped). The exact relationship — travel = displacement × gain × screen
-width — is pinned by tests in `tests/test_sensitivity_dial.py` (`test_travel_matches_the_documented_units`,
-`test_double_the_gain_doubles_the_travel`, `test_turning_the_dial_mid_motion_does_not_rescale_what_is_already_on_screen`).
+width — is pinned by tests in `tests/test_sensitivity_dial.py`
+(`test_travel_matches_the_documented_units`, `test_double_the_gain_doubles_the_travel`,
+`test_turning_the_dial_mid_motion_does_not_rescale_what_is_already_on_screen`).
 
 ### Phase status — which phases are actually implemented (audited 2026-10-10)
 
@@ -379,25 +493,28 @@ updated since.
 
 | Phase | Status | Exists | Missing |
 | --- | --- | --- | --- |
-| 1 — Foundation & safety | ✅ **5/5 (2026-10-10)** | Modules split: `capture.py`, `gesture.py`, `output.py` (adapters), `runtime.py` (coordinator), `main.py` (CLI); `requirements.txt`; 222-test suite; **paused startup** with SPACE toggle and ESC/q quit; **`RecordingMouseOutput` mock adapter** used by tests and `--dry-run`; macOS permission docs in README | — |
+| 1 — Foundation & safety | ✅ **5/5 (2026-10-10)** | Modules split: `capture.py`, `gesture.py`, `output.py` (adapters), `runtime.py` (coordinator), `main.py` (CLI); `requirements.txt`; 256-test suite; **paused startup** with SPACE toggle and ESC/q quit; **`RecordingMouseOutput` mock adapter** used by tests and `--dry-run`; macOS permission docs in README | — |
 | 2 — Capture pipeline | ✅ **5/5 (2026-10-10)** | `capture.py`'s threaded `ThreadedCamera` (`isOpened()` error, buffer size, device-error reporting); `cv2.flip` mirroring, BGR→RGB, `mp.solutions.hands`, invalid-frame error, exception-safe teardown (the runtime's `try/finally`); **`landmarks.py`** (Landmark/HandLandmarks, the single protobuf conversion point, incomplete detections flagged); **preview overlay** of the loop rate *and* the 21-point skeleton (`preview.py`, drawn with cv2, `show_landmarks`) | — |
 | 3 — Geometry/mapping/smoothing | ✅ **5/5 (2026-10-10)** | `gesture.py`: distances, `midpoint`/`midpoints`, `pinch_distances`, `hand_scale` + `hand_span`, `clamp`/`clamp_point`, `mirror_point`, EMA; `mapping.py`: `Region` + `map_point_to_screen` (frame region → screen region, clamping, mirroring); `smoothing.py`: EMA + 1-euro filters with `reset()`, wired into the runtime with a tracking-loss reset; 44 deterministic tests for distances, clamping, smoothing, latency and reset | Midpoints are available but not yet *used* by a gesture; One Euro parameters are tuned for this camera rather than for everyone |
 | 4 — Gesture state machine | ✅ **5/5 (2026-10-10)** | `recognizer.py`: `HandState` (neutral / left pinch / right pinch / two-finger scroll / paused / tracking-lost), `EventKind` + `GestureEvent`, `GestureThresholds`/`Observation`/`GestureUpdate`, `GESTURE_PRIORITY`; thumb–index vs thumb–middle pinch detection from `pinch_distances()` ÷ `hand_scale`; per-pair hysteresis, hold time, cooldown, re-arm (`reset(disarm=True)`), scroll-priority resolution, "no switch without neutral", scroll reference/dead-zone/gain; wired into the runtime via `apply_gestures()` behind `can_emit`, with the paused/tracking states driven by the pause key and the frame loop; 72 new tests (54 recogniser + 18 runtime) | The thresholds are reasoned defaults, not measured against a real hand (Phase 9 owns calibration); horizontal scroll is computed and reported (`GestureEvent.secondary`) but not yet emitted |
-| 5 — Cursor movement | 🟡 **3/5 + 1 partial** | Palm/wrist-relative pointer pipeline (see §2 "Pointer reference") with smoothing, clamp and `min_move_pixels`; **dry-run and real adapters** (`output.py`); **opt-in gate** (starts paused, `--dry-run`); paused/bounds suppression; re-anchor on reacquire; the explicit *tracking-lost* state Phase 4 defined (`HandState.TRACKING_LOST`, emitted once per loss) | A real rate limit/coalescer and the absolute mapping's calibration |
+| 5 — Cursor movement | 🟡 **4/5 (2026-10-10)** | **Absolute position mapping is now the default scheme** (`pointer_mode="absolute"`, inner 70% of the frame → whole screen) with the dial scales its reach, so every screen edge and corner is directly reachable — measured, see §2 "Reach and the sensitivity floor"; palm/wrist-relative pipeline still available and tested; smoothing, clamp and `min_move_pixels`; **dry-run and real adapters**; **opt-in gate** (starts paused, `--dry-run`); paused/bounds suppression; the explicit *tracking-lost* state (`HandState.TRACKING_LOST`, emitted once per loss, filter and anchor reset) | A real rate limit/coalescer (the last bullet) |
 | 6 — Left & right clicks | 🟡 **3/5 + 1 partial** | Left click, right click (thumb–middle), shared cooldown, release-then-re-arm, **scroll precedence** and last-action suppression — all in the recogniser, whose 72 tests assert exact click counts; **suppressed while paused** (Phase 1's `can_emit` gate and the recogniser's own `PAUSED` state, including a pinch held across a resume); the legacy inline path (L1 pinch test, `is_right_click_gesture`) is still reachable via `--gesture-engine legacy` | Last-action status on the preview (hovering a click's target is not tracked); the legacy path still re-implements the pinch inline |
 | 7 — Two-finger scroll | 🟡 **3/5 + 1 partial** | Two-finger (index+middle) pose with the midpoint as reference, reference reset on entry, dead zone, configurable `scroll_gain` (900) and direction (negative = page down), **click suppression while scrolling** (the pose scrolls instead of clicking); horizontal component computed and reported | Emitting the horizontal component, direction inversion as a config field, and rate limiting; the *legacy* index-finger scroll path is unchanged (and still non-conforming) |
 | 8 — Pause/runtime/feedback | 🟡 **4/5 + 1 partial** | `runtime.py` coordinator; configurable keyboard toggle (`toggle_pause_keys`) with paused startup; PAUSED/ACTIVE **and the live gesture state** on the preview (`f"… fps  {gesture_state}"`); the recogniser's `PAUSED`/`TRACKING_LOST` states, kept in step by `_sync_gesture_pause()` and the no-hand branch; exception-safe teardown (`try/finally`) | The optional *gesture* pause, and tests for toggle idempotence, recovery and window-close cleanup |
 | 9 — Calibration/hardening | ⛔ **0/5 + 1 partial** | `HandMouseConfig` with the tunables this phase asks for — camera, margins, smoothing, pinch thresholds, cooldown, hotkeys (`toggle_pause_keys`/`quit_keys`/the dial's key tuples) and sensitivity, now adjustable at **runtime** via the dial (`set_sensitivity`/`adjust_sensitivity`, `]`/`[`/`0`, `--sensitivity`, `--sensitivity-step`) | Mirroring as a config field, diagnostics, logging (0 hits), profiling, packaging (`pyproject.toml`), final setup docs, and the settings-do-not-persist gap: the dial's value is per-session (pass `--sensitivity` to pin it) |
-| Tests | 222 passing | gesture helpers; config defaults; cursor-move guard; camera error path; the Phase 1 safety suite; the pointer-reference suite (curl must not move the cursor, gain/clamp/deadzone maths, re-anchor, scroll guard — now pinned to `gesture_engine="legacy"`); the landmark suite (protobuf conversion, incomplete hands, skeleton pixels); the Phase 3 geometry suite (distances, midpoints, clamping, region mapping); the Phase 3 smoothing suite (EMA + 1-euro behaviour, jitter, latency, tracking-loss reset); the Phase 4 recogniser suite (54 cases) and runtime suite (18 cases); the sensitivity-dial suite (38 cases: clamping, multiplicative notches, the keys, the bar, the CLI flags, cursor travel scaling) | MediaPipe's own detections, the real camera path, and the legacy click/scroll branches beyond the pinned cases |
+| Tests | 256 passing | gesture helpers; config defaults; cursor-move guard; camera error path; the Phase 1 safety suite; the pointer-reference suite (curl must not move the cursor, gain/clamp/deadzone maths, re-anchor, scroll guard — pinned to `pointer_mode="relative"`); the landmark suite; the Phase 3 geometry and smoothing suites; the Phase 4 recogniser suite (54 cases) and runtime suite (18 cases); the sensitivity-dial suite (38 cases); the pointer-modes suite (21 cases: absolute is the default, the frame region's corners reach the screen's corners, landmarks outside it clamp, curl does not move the cursor in absolute mode, the floor clamps the dial *and* a `--sensitivity` below it, and lowering the floor by hand reproduces the unreachable-edge bug); the smoothness suite (15 cases: a still hand's steps stay under 4 px, `beta=8` is measurably worse than `beta=0`, a slow sweep never holds a frame, the old deadzone reproduces the holding/jumping, the guard stops sub-threshold moves) | MediaPipe's own detections, the real camera path, and the legacy click/scroll branches beyond the pinned cases |
 
 **What this means for the next session:**
 
 - **Phases 1–4 are done.** Capture, geometry, mapping, smoothing, the safety layer and the gesture
   state machine are in place and tested, so every remaining phase can be built on a pipeline that
   cannot hurt the desktop and does not need a camera in the test suite.
-- **Phase 5 is the next real step**: it is now the only phase whose deliverable list still has a
-  *missing* item that nothing else covers — a real rate limit/coalescer — plus the absolute mapping's
-  calibration. The tracking-lost suppression it was waiting on exists (`HandState.TRACKING_LOST`).
+- **The control scheme is absolute position by default** (changed 2026-10-10) with the sensitivity dial
+  scaling its reach and floored at gain 1.0 so the screen stays reachable; `--pointer-mode relative`
+  restores the displacement-based scheme. Read §2 "Pointer reference and control scheme" and "Reach and
+  the sensitivity floor" before touching either — the reachability requirement is the reason for both.
+- **Phase 5 is one bullet from done**: a real rate limit/coalescer for cursor moves. Everything else in
+  its list is implemented and tested.
 - **Retrofit, don't rewrite.** Every phase so far added a module and switched the runtime over while
   leaving the previous path reachable (EMA next to One Euro, index next to palm, absolute next to
   relative, `legacy` next to `recognizer`). Keep doing that: it is what makes the changes reviewable
@@ -406,6 +523,13 @@ updated since.
   is now thumb–middle, the two-finger pose scrolls instead of right-clicking). The old behaviour is one
   flag away (`--gesture-engine legacy`) if the user prefers it — but do not flip the default back
   without being asked.
+- **The pointer path's smoothness is now measured, not guessed** (2026-10-10). `deadzone=0.0` and a
+  4 Hz / `beta=0.0` cursor filter replaced a hold-then-jump grid and a filter that was silently off;
+  read §2 "Smoothness: the stutter, found and fixed" before touching `deadzone`, `min_move_pixels`,
+  `pointer_deadzone`, `one_euro_min_cutoff` or `one_euro_beta`, and re-run
+  `python3 tools/measure_smoothness.py` after any change (it needs no camera). The trap that hid the
+  bug for a whole phase: **a filter parameter's units are part of its contract** — One Euro's `beta` is
+  a pixel-unit constant, so feeding it screen pixels with `beta=8` disabled the filter.
 - **Phases 7–9 still own the rough edges:** the horizontal scroll component is computed but not
   emitted, `scroll_gain`'s direction has no config field, there is no logging or packaging, and the
   recogniser's thresholds are reasoned defaults rather than measured against a real hand.
@@ -628,11 +752,14 @@ repeated pinches, ambiguous input, tracking loss, and simultaneous gestures.
 
 ### Phase 5 — Cursor movement
 
-**Status: 🟡 3/5 (updated 2026-10-10).** The adapter split landed with Phase 1 (`RealMouseOutput` /
-`RecordingMouseOutput`), cursor output is opt-in (the app starts paused; `--dry-run` emits nothing at
-all), moves smaller than `min_move_pixels` are skipped, and the tracking-lost suppression the phase was
-waiting on exists now (`HandState.TRACKING_LOST`, emitted once per loss, with the filter and anchor
-reset). What remains: a genuine rate limit/coalescer, and the absolute mapping's calibration.
+**Status: 🟡 4/5 (updated 2026-10-10).** Four of the five bullets are done, and the mapping the phase
+asked to calibrate is now the **default scheme**: absolute position mapping (the inner 70% of the frame →
+the whole screen) with the sensitivity dial scaling its reach, so every screen edge and corner is
+directly reachable — measured with `tools/measure_loop.py --sweep-reach` (all four edges at gains 1.0, 3.0
+and 8.0). Also in place: the dry-run and real cursor adapters, cursor output behind the `can_emit` gate
+(the app starts paused), moves below `min_move_pixels` skipped, bounds clamping, and the explicit
+tracking-lost suppression (`HandState.TRACKING_LOST`, with the filter and anchor reset). What remains is a
+genuine rate limit/coalescer.
 
 - Map filtered coordinates to the active screen.
 - Add dry-run and real cursor adapters.
@@ -788,6 +915,24 @@ tracking, sustained gestures, repeated launch/cleanup, and full regression check
   preview readout, the CLI flag and the summary always agree; the keys are just a keyboard front end for
   that one setter. Anything tunable at runtime should follow this shape: one field, one setter, one
   readout.
+- **The controls must be able to reach every corner of the screen.** That is why the default scheme is
+  absolute position and why the dial has a floor at gain 1.0 (`sensitivity_min` =
+  `sensitivity_reach_floor`): one frame width of hand travel must cover at least one screen width. A
+  setting that silently strands a strip of the screen at an edge is a bug, not a preference — so when a
+  knob can make the screen unreachable, it clamps, and if it is overridden anyway the runtime says so
+  (`reach_warning`, and `! edges unreachable` on the HUD). Reach is judged with the hand *stopped* at
+  the edge (`--reach-dwell`, the way a user points at a corner), because a lagging filter is expected to
+  trail while the hand is still travelling — that is the smoothness trade, not a reach failure.
+- **The cursor reference is never frozen to hide jitter; the filter smooths it.** A deadzone on the
+  absolute reference trades a continuous, tiny error for a discontinuous, large one — the hold-then-jump
+  that was reported as "snapping to a grid" (measured: 80 of 90 frames held, then a ~65 px jump, and
+  +39 px of trailing). `deadzone` therefore defaults to 0 and, when used, is a radius in frame units
+  (documented in px: `0.02` ≈ 49 px), never a per-axis box.
+- **A numeric parameter's units are part of its contract.** `one_euro_beta` is defined for pixel-scale
+  coordinates; the runtime feeds it screen pixels, where any value ≥ 0.1 saturates the cutoff and turns
+  the filter off (measured alpha 0.96 at 0.5 px/frame with `beta=8`). When wiring a library's tuned
+  constant, either feed it the units it was tuned for or re-derive it — and measure, because this class
+  of bug is invisible in the code and described by the user as "it feels bad".
 
 ---
 
@@ -800,6 +945,9 @@ Before reporting a phase complete:
 - [ ] No test or default configuration can move the real cursor, click or scroll.
 - [ ] New behaviour is additive; existing working behaviour is unchanged.
 - [ ] Any measured number is backed by a recorded run (seed + config stored), not a guess.
+- [ ] Anything touching the pointer path (reference, deadzone, filter, gain, mapping) is checked with
+      `python3 tools/measure_smoothness.py` and, for reach, `python3 tools/measure_loop.py
+      --synthetic-hand --active --sweep-reach 30 --reach-dwell 12`.
 - [ ] The §2 phase status table and this phase's own `Status:` line are updated to match what you
       actually built (they are the next session's starting point).
 - [ ] Anything the platform cannot do is stated plainly, not papered over.
@@ -913,3 +1061,24 @@ disengaged, not only on a release transition, or a hand held open can never pinc
 per-pair `_armed` flag is what makes "a pinch held across a resume is consumed" true, and it has to be
 set on the fire path *and* on a suppressed click. When adding a transition, ask what clears it — if the
 answer is "another gesture", it is wrong.
+
+**8.12 `pyautogui`'s tween cannot be used to smooth a 30 fps cursor — and its `moveTo` silently
+ignores small durations.** `_mouseMoveDrag` only tweens when `duration > MINIMUM_DURATION`, and
+`MINIMUM_DURATION` is **0.1 s**, with the per-step sleep floored at `MINIMUM_SLEEP = 0.05 s`. So
+`pyautogui.moveTo(x, y, duration=0.01)` does *nothing* (measured 0.2-0.7 ms per call, i.e. a teleport),
+and passing a value above the threshold blocks the loop for **171 ms per move** (measured, `duration=0.11`
+→ 5.2 camera frame intervals; the loop drops to ~6 fps and the cursor lags permanently). There is no
+usable per-frame tween on this backend: smoothness has to come from the reference and the filter. Anything
+like "just add a short duration to each move" is a dead end — hence `mouse_move_duration` was removed
+rather than shipped as a knob with an empty useful range.
+*Measure it without moving anything:* patch the platform hook (`pyautogui._pyautogui_osx._moveTo`) to a
+no-op and time `moveTo` — `pyautogui.moveTo` resolves the platform move through `platformModule`, so the
+stub is effective, and the real cursor never moves.
+
+**8.13 A filter fed the wrong units fails silently and looks like "it feels bad".** The runtime smooths
+screen-pixel positions, but One Euro's `beta` is defined for pixel-scale coordinates: with
+`one_euro_beta=8.0` the cutoff is `min_cutoff + beta × speed`, which at 30 px/s (1 px/frame) is 244 Hz —
+`alpha 0.96`, i.e. no filtering at all. The filter still *runs* and still returns plausible numbers, so
+nothing in the code or the tests looked wrong; the symptom was the user reporting a stutter.
+`one_euro_beta` is now 0.0 with a 4 Hz cutoff. When wiring any tuned constant, check the units of both
+sides and measure the response (`tools/measure_smoothness.py`, `--one-euro-beta`), not just that it runs.

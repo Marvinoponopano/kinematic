@@ -291,6 +291,9 @@ class HandMouseRuntime:
         if not needs_cursor_update(previous, smoothed, self.config.min_move_pixels):
             return False
 
+        # duration stays 0: pyautogui tweens only above its MINIMUM_DURATION of 0.1 s, and a tween
+        # that long blocks the loop for ~171 ms (5 frame intervals) — measured in
+        # tools/measure_smoothness.py's notes, so there is no usable per-frame tween on this stack.
         self.output.move_to(self.cursor_x, self.cursor_y, duration=0)
         self.emitted += 1
         return True
@@ -478,9 +481,9 @@ class HandMouseRuntime:
         if self.config.pointer_mode == "absolute":
             anchor = self.last_pointer_ref
             if self.config.deadzone > 0 and anchor is not None:
-                dx = abs(reference[0] - anchor[0])
-                dy = abs(reference[1] - anchor[1])
-                if dx <= self.config.deadzone and dy <= self.config.deadzone:
+                # A radius, not a per-axis box: freezing when *either* axis is inside the box pins
+                # slow diagonal movement to a grid, which is the snapping this replaced.
+                if point_distance(anchor, reference) <= self.config.deadzone:
                     reference = anchor
             self.last_pointer_ref = reference
             emitted += int(self.update_cursor(reference, now=now))

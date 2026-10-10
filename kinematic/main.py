@@ -165,9 +165,22 @@ def main(argv: Optional[list] = None) -> int:
         f"kinematic: pointer mode={runtime.config.pointer_mode} "
         f"reference={runtime.config.pointer_reference} "
         f"sensitivity={runtime.config.pointer_sensitivity} "
-        f"deadzone={runtime.config.pointer_deadzone} "
         f"smoothing={runtime.config.smoothing_mode}"
+        + (
+            f"(min_cutoff={runtime.config.one_euro_min_cutoff} beta={runtime.config.one_euro_beta})"
+            if runtime.config.smoothing_mode == "one_euro"
+            else f"(factor={runtime.config.smoothing})"
+        )
     )
+    # The two deadzones are different things and were both printed as "deadzone" once, which is how a
+    # 49 px freeze in absolute mode went unnoticed: `pointer_deadzone` is the *relative* mode's hand
+    # displacement filter, `deadzone` is the absolute mode's reference hold.
+    if runtime.config.pointer_mode == "absolute":
+        px = runtime.config.deadzone / max(1e-9, 1.0 - 2 * runtime.config.frame_margin) * runtime.screen_w
+        print(f"kinematic: absolute mode reference hold={runtime.config.deadzone} ({px:.1f} px of screen), "
+              f"frame margin={runtime.config.frame_margin}")
+    else:
+        print(f"kinematic: relative mode hand deadzone={runtime.config.pointer_deadzone} (displacement below it is held back)")
     print(
         f"kinematic: gestures engine={runtime.config.gesture_engine} "
         f"pinch_ratio={runtime.config.pinch_ratio} "

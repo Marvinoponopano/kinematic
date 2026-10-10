@@ -23,6 +23,7 @@ class MouseEvent:
     kind: str  # "move" | "click" | "scroll"
     value: Any  # (x, y) for move, button name for click, amount for scroll
     at: float  # time.monotonic() when it happened
+    duration: float = 0.0  # tween the move was asked for (0 = teleport)
 
 
 class MouseOutput:
@@ -101,7 +102,7 @@ class RecordingMouseOutput(MouseOutput):
 
     def move_to(self, x: float, y: float, duration: float = 0.0) -> None:
         self._position = (float(x), float(y))
-        self.events.append(MouseEvent("move", self._position, time.monotonic()))
+        self.events.append(MouseEvent("move", self._position, time.monotonic(), duration))
 
     def click(self, button: str = "left") -> None:
         self.events.append(MouseEvent("click", button, time.monotonic()))
