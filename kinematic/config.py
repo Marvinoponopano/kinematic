@@ -76,6 +76,7 @@ class HandMouseConfig:
     #   palm-relative pointing, translating the hand would otherwise scroll the page
     #   while it moves the cursor.
 
+
     # --- Phase 3: smoothing and screen mapping ------------------------------
     smoothing_mode: str = "one_euro"
     #   "one_euro" (default, changed 2026-10-10) = the 1-euro filter: it beat the previous
@@ -97,6 +98,28 @@ class HandMouseConfig:
     #   your hand to the very edge of the frame.
     screen_margin: float = 0.0
     #   Absolute mode only: margin kept free at the screen edges.
+    # --- Phase 4: gesture recogniser ----------------------------------------
+    gesture_engine: str = "recognizer"
+    #   "recognizer": the pure timestamp-driven state machine in recognizer.py — relative
+    #   thresholds, per-pair hysteresis, hold/cooldown/re-arm, scroll ahead of clicks.
+    #   "legacy": the pre-Phase-4 inline booleans and L1 pinch test, kept reachable so the
+    #   previous feel can be compared or restored without a code change.
+    pinch_ratio: float = 0.40
+    #   A thumb-index / thumb-middle distance that counts as a pinch, as a fraction of the
+    #   hand's scale (wrist -> middle knuckle). Relative, so it no longer drifts with distance
+    #   from the camera; 0.40 reproduces the old absolute click_threshold at a nominal hand.
+    pinch_release_ratio: float = 1.4
+    #   Hysteresis: a pinch only releases above pinch_ratio * this, so a hand hovering at the
+    #   threshold cannot chatter.
+    pinch_hold_seconds: float = 0.08
+    #   How long a pose must hold before it registers — about 2.4 frames at 30 fps.
+    click_cooldown_seconds: float = 0.18
+    #   Minimum spacing between two clicks; a click inside the window is dropped, not deferred.
+    scroll_deadzone_ratio: float = 0.05
+    #   Two-finger movement below this (in hand widths) is ignored and accumulates.
+    scroll_gain: float = 900.0
+    #   Scroll units per hand width of two-finger movement (the old hard-coded 900).
+
     pointer_scale: float = 1.0
     #   Extra gain applied after the region mapping (absolute mode only). Was 1.8 with the
     #   old pointer_scale-times-frame mapping, which skewed the reachable area off-centre;

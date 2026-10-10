@@ -187,7 +187,10 @@ class PauseToggleTests(unittest.TestCase):
         pinched[4] = (0.505, 0.405)
 
         output = RecordingMouseOutput()
-        runtime = make_runtime(output=output, hands=FakeHands(points=pinched))
+        # Pinned to the legacy engine: this test documents the pre-Phase-4 inline click path. The
+        # equivalent property for the recogniser (and its default) is covered in
+        # tests/test_phase4_runtime.py.
+        runtime = make_runtime(output=output, hands=FakeHands(points=pinched), gesture_engine="legacy")
         runtime.run(camera=FakeCamera(frames(3)), max_frames=3)
         self.assertEqual(output.clicks, [], "nothing may fire while paused")
 
@@ -206,7 +209,12 @@ class PauseToggleTests(unittest.TestCase):
         points = [(0.5, 0.5) for _ in range(21)]
         points[8] = (0.50, 0.40)
         points[4] = (0.505, 0.405)
-        runtime = make_runtime(output=output, hands=FakeHands(points=points), start_paused=False)
+        runtime = make_runtime(
+            output=output,
+            hands=FakeHands(points=points),
+            start_paused=False,
+            gesture_engine="legacy",  # the inline click path; see the Phase 4 runtime suite
+        )
         runtime.run(camera=FakeCamera(frames(8)), max_frames=8)
         self.assertEqual(len(output.clicks), 1, "a sustained pinch is one click, not one per frame")
 

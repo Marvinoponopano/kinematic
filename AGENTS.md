@@ -1,7 +1,7 @@
 # AGENTS.md — Kinematic (webcam hand mouse)
 
 Context file for AI coding agents working in this repo. Read this before touching code.
-Last updated: 2026-10-10 (Phases 1–3 of the roadmap complete — see §2 "Phase status" and §5).
+Last updated: 2026-10-10 (Phases 1–4 of the roadmap complete — see §2 "Phase status" and §5).
 
 > If your tool looks for a different filename (`CLAUDE.md`, `.cursorrules`, `.windsurfrules`,
 > `.github/copilot-instructions.md`), copy or symlink this file to that name — the content is
@@ -42,6 +42,8 @@ kinematic/
 │   ├── mapping.py         # Region + map_point_to_screen (frame region -> screen region)
 │   ├── output.py          # MouseOutput adapters: RealMouseOutput / RecordingMouseOutput (mock)
 │   ├── preview.py         # landmark skeleton drawing for the debug preview (drawn with cv2, no protobuf)
+│   ├── recognizer.py      # Phase 4: the pure gesture state machine (states, relative thresholds,
+│   │                      #   hysteresis, hold/cooldown/re-arm, scroll priority, event list)
 │   ├── runtime.py         # HandMouseRuntime: pipeline coordinator + the pause gate on all output
 │   ├── smoothing.py       # cursor filters: ExponentialMovingAverage, OneEuroFilter (both resettable)
 │   └── main.py            # CLI + HandMouseApp facade over the runtime
@@ -52,9 +54,12 @@ kinematic/
     ├── test_phase2_landmarks.py  # 15 cases: protobuf conversion, hand protocol, skeleton drawing
     ├── test_phase3_geometry.py   # 23 cases: distances, midpoints, clamping, region mapping
     ├── test_phase3_smoothing.py  # 21 cases: EMA + 1-euro behaviour, jitter, latency, reset
+    ├── test_phase4_recognizer.py # 54 cases: transitions, hysteresis, hold/cooldown/re-arm, priority, scroll
+    ├── test_phase4_runtime.py    # 18 cases: the recogniser wired in, the pause gate, the legacy engine
     └── test_pointer_reference.py # 21 cases: wrist/palm reference, curl must not move the cursor, scroll guard
 tools/
 ├── compare_smoothing.py         # seeded jitter-vs-lag comparison of the cursor filters
+├── gesture_trace.py             # scripted poses through the recogniser: transition table, no camera
 ├── measure_loop.py              # measure the loop rate with the mouse intercepted (nothing moves)
 └── measure_stability.py         # per-frame wrist/palm jitter vs pointer_deadzone (no output adapter at all)
 ```
@@ -73,9 +78,12 @@ python3 -m kinematic.main --dry-run --no-preview   # whole pipeline, zero output
 python3 -m kinematic.main --pointer-reference wrist    # use the wrist joint instead of the palm
 python3 -m kinematic.main --pointer-mode absolute      # old position-mapped pointing
 python3 -m kinematic.main --smoothing-mode ema         # the pre-Phase-3 fixed-factor filter
-python3 -m unittest discover -s tests       # 112 tests, all pass
+python3 -m kinematic.main --gesture-engine legacy      # the pre-Phase-4 inline pinch/scroll tests
+python3 -m unittest discover -s tests       # 184 tests, all pass
 python3 tools/compare_smoothing.py          # seeded jitter vs lag table for the cursor filters
+python3 tools/gesture_trace.py              # every scripted pose through the recogniser, transition by transition
 python3 tools/measure_loop.py --synthetic-hand --active --fingers-only   # the finger-curl regression demo
+python3 tools/measure_loop.py --synthetic-hand --active --synthetic-pinch two_finger   # the scroll pose in the real loop
 python3 tools/measure_stability.py --seconds 15          # tune pointer_deadzone against your own hand
 ```
 
@@ -103,15 +111,19 @@ Also present but not used by this project: Homebrew `python3.13` / `python3.14`,
 - ~~The cursor followed the index fingertip~~ — **fixed 2026-10-10.** Fingers curling or spreading
   dragged the cursor around while the hand itself was still. The cursor now follows the wrist/palm
   (see §2 "Pointer reference"), so finger articulation cannot move it.
-- **No scroll mode.** `runtime.handle_scroll()` still drives scrolling from *index-finger* movement
-  (gain hardcoded `-900`), but only while the hand itself holds still, so pointing no longer scrolls the
-  page. A real two-finger scroll gesture with a dead zone and sensitivity is still Phase 7.
-- **Duplicated pinch logic.** `runtime.handle_clicks()` computes pinch as a raw L1 distance
-  (`abs(dx)+abs(dy) < click_threshold`) instead of calling the already-tested `gesture.is_pinch()`.
-  Note `is_right_click_gesture()` means *thumb–index AND index–middle* both
-  pinched, which is stricter than a "right pinch".
-- **Thresholds are absolute landmark distances**, not relative to hand scale — they drift with
-  distance from the camera. Phase 4 replaces them with hand-scale-relative thresholds.
+- ~~**No scroll mode.**~~ **Replaced in Phase 4** — `runtime.handle_scroll()` (index-finger
+  movement, gain hardcoded `-900`) still exists as the legacy path, but the default engine scrolls
+  from the two-finger pose instead, with a dead zone, a configurable gain and click suppression. See
+  §2 "Gestures".
+- ~~**Duplicated pinch logic.**~~ **Resolved in Phase 4 for the default engine.** The recogniser
+  computes pinch from `gesture.pinch_distances()` divided by hand scale; the inline L1 test
+  (`abs(dx)+abs(dy) < click_threshold`) remains only in the legacy engine, and
+  `gesture.is_pinch()`/`is_right_click_gesture()` are still used by nothing but their own tests.
+- ~~**Thresholds are absolute landmark distances**~~ — **fixed in Phase 4.** `pinch_ratio` and its
+  release ratio are multiples of the hand's scale, so a pinch engages at the same physical pose near
+  and far from the camera (tested: the same pose on a 0.10-scale and a 0.20-scale hand behaves
+  identically). The legacy fields `click_threshold`/`right_click_threshold`/`scroll_threshold` are
+  still in the config for that path.
 - ~~The absolute mapping was not calibrated~~ — **fixed in Phase 3.** `pointer_scale × clamp` (which
   skewed the reachable area off-centre) is replaced by `mapping.map_point_to_screen()`: the inner 70% of
   the frame maps onto the whole screen, with configurable frame and screen margins.
@@ -250,13 +262,68 @@ Measuring this correctly matters: timing the loop from outside is wrong — macO
 (`python3 tools/measure_loop.py`, add `--synthetic-hand --active` to measure the cursor path without
 putting a hand in front of the camera).
 
+### Gestures: the Phase 4 recogniser (2026-10-10)
+
+`recognizer.py` is the only gesture logic the default pipeline uses. It is pure — no camera, no
+MediaPipe, no mouse, no clock of its own: `update(Observation(landmarks, timestamp))` returns a
+`GestureUpdate(state, events)`, and `runtime.apply_gestures()` is the single place that turns an event
+into an adapter call (still behind `can_emit`).
+
+**The gesture map, and what changed.** Poses are resolved by explicit priority
+(`GESTURE_PRIORITY` = scroll → left → right), so a pose that could mean two things never does:
+
+| Pose | State | Event | Before Phase 4 |
+| --- | --- | --- | --- |
+| thumb–index pinch, middle finger away | `LEFT_PINCH` | `left_click` | same finger, but an absolute L1 threshold and no hold time |
+| thumb–middle pinch, index away | `RIGHT_PINCH` | `right_click` | **changed** — the old right click was thumb–index *and* index–middle pinched |
+| thumb touches both index and middle | `TWO_FINGER_SCROLL` | `scroll_begin` / `scroll` / `scroll_end` | **changed** — the old scroll was index-finger movement with a still-hand guard, and this pose used to fire a right click |
+| no hand in frame | `TRACKING_LOST` | `tracking_lost` / `tracking_restored` | new — the runtime used to reset silently |
+| paused | `PAUSED` | `paused` / `resumed` | new — the state machine models the pause key |
+
+**The rules** (each has its own tests):
+
+- **Relative thresholds** — `pinch_ratio` (0.40) and `release_ratio` (1.4, so release above 0.56) are
+  multiples of `hand_scale`; the same pose on a small and a large hand gives the same verdict.
+- **Hysteresis, per pair** — engage below 0.40, release only above 0.56, so a hand resting at the
+  threshold cannot chatter (100 alternating frames → exactly one click).
+- **Hold time** — `pinch_hold_seconds` (0.08 s) must elapse before a pose registers; the clock starts
+  on the pose's own first frame and a flicker restarts it.
+- **Cooldown and re-arm** — two clicks are never closer than `click_cooldown_seconds` (0.18 s), and a
+  pair must be released above the release threshold before it can fire again. A click inside the
+  cooldown is dropped, not deferred.
+- **Scroll reference** — the two-finger midpoint is the reference, reset on entry (so movement during
+  the hold cannot jump the page); movement below `scroll_deadzone_ratio` × hand scale is ignored and
+  accumulates; `scroll_gain` (900) converts hand widths into scroll units (negative = page down).
+- **No gesture switch without neutral** (`require_neutral_between`) — going straight from one pinch to
+  another is ignored; release first. The same rule is why a pinch held across a resume or a tracking
+  loss is *consumed* rather than queued: those pairs come back disarmed and must be pinched again.
+
+**Evidence** (real camera, mouse calls intercepted and counted, 150 frames ≈ 5 s, synthetic hand
+tapping 5 times in the clip):
+
+| Engine | Synthetic pose | move | click | scroll |
+| --- | --- | --- | --- | --- |
+| `recognizer` (default) | left pinch | 121 | **5** | 0 |
+| `recognizer` | right pinch | 121 | **5** | 0 |
+| `recognizer` | two-finger | 121 | **0** | **5** |
+| `legacy` | left pinch | 121 | 6 | 0 |
+| `legacy` | two-finger | 121 | 6 | **0** |
+
+Exactly one click per deliberate tap under the recogniser; the legacy path fires one *or two* clicks
+per tap (left and right can both trigger on the same pose) and never scrolls from the two-finger pose.
+With `--fingers-only` — the finger-curl input that used to drag the cursor — the recogniser engine
+still reports **0 moves** over 120 frames, so the pointer fix is unaffected.
+
+`python3 tools/gesture_trace.py` prints these transitions without a camera: use it to see what a pose
+does and to sanity-check the thresholds against your own hand (`--pinch-ratio`, `--hold`, `--cooldown`).
+
 ### Phase status — which phases are actually implemented (audited 2026-10-10)
 
-**Phase 1 is complete (5/5). Phases 2 and 3 are complete too (5/5 each).** Before Phase 1 this repo
-was a prototype that drove the real mouse from startup with none of the safety layer in place; that is
-fixed — see §5 for what each phase landed. Phases 4–9 are not implemented in the shape the plan asks
-for, though the prototype's subject matter (clicks, scroll) exists in some form; read each phase's own
-`Status:` line below before starting work.
+**Phases 1, 2, 3 and 4 are complete (5/5 each).** Before Phase 1 this repo was a prototype that drove
+the real mouse from startup with none of the safety layer in place; that is fixed — see §5 for what
+each phase landed. Phases 5–9 are not implemented in the shape the plan asks for, though the
+prototype's subject matter (clicks, scroll) exists in some form; read each phase's own `Status:` line
+below before starting work.
 
 *How this was audited:* every non-`.git` file was listed and read; the source was grep'd for each
 phase's marker concepts (`pause`, `mock`, `record`, `adapter`, `dry`, `Enum`, `state`, `hyster`,
@@ -267,33 +334,36 @@ updated since.
 
 | Phase | Status | Exists | Missing |
 | --- | --- | --- | --- |
-| 1 — Foundation & safety | ✅ **5/5 (2026-10-10)** | Modules split: `capture.py`, `gesture.py`, `output.py` (adapters), `runtime.py` (coordinator), `main.py` (CLI); `requirements.txt`; 112-test suite; **paused startup** with SPACE toggle and ESC/q quit; **`RecordingMouseOutput` mock adapter** used by tests and `--dry-run`; macOS permission docs in README | — |
+| 1 — Foundation & safety | ✅ **5/5 (2026-10-10)** | Modules split: `capture.py`, `gesture.py`, `output.py` (adapters), `runtime.py` (coordinator), `main.py` (CLI); `requirements.txt`; 184-test suite; **paused startup** with SPACE toggle and ESC/q quit; **`RecordingMouseOutput` mock adapter** used by tests and `--dry-run`; macOS permission docs in README | — |
 | 2 — Capture pipeline | ✅ **5/5 (2026-10-10)** | `capture.py`'s threaded `ThreadedCamera` (`isOpened()` error, buffer size, device-error reporting); `cv2.flip` mirroring, BGR→RGB, `mp.solutions.hands`, invalid-frame error, exception-safe teardown (the runtime's `try/finally`); **`landmarks.py`** (Landmark/HandLandmarks, the single protobuf conversion point, incomplete detections flagged); **preview overlay** of the loop rate *and* the 21-point skeleton (`preview.py`, drawn with cv2, `show_landmarks`) | — |
 | 3 — Geometry/mapping/smoothing | ✅ **5/5 (2026-10-10)** | `gesture.py`: distances, `midpoint`/`midpoints`, `pinch_distances`, `hand_scale` + `hand_span`, `clamp`/`clamp_point`, `mirror_point`, EMA; `mapping.py`: `Region` + `map_point_to_screen` (frame region → screen region, clamping, mirroring); `smoothing.py`: EMA + 1-euro filters with `reset()`, wired into the runtime with a tracking-loss reset; 44 deterministic tests for distances, clamping, smoothing, latency and reset | Midpoints are available but not yet *used* by a gesture; One Euro parameters are tuned for this camera rather than for everyone |
-| 4 — Gesture state machine | ⛔ **0/5** | Only a rising-edge boolean + `debounce_seconds` in `runtime.py` | States/`Enum` (0 hits), hysteresis, hold times, hand-scale-relative thresholds, pure recognizer with injected timestamp, scroll precedence |
-| 5 — Cursor movement | 🟡 **3/5 + 1 partial** | Palm/wrist-relative pointer pipeline (see §2 "Pointer reference") with smoothing, clamp and `min_move_pixels`; **dry-run and real adapters** (`output.py`); **opt-in gate** (starts paused, `--dry-run`); paused/bounds suppression; re-anchor on reacquire | A real rate limit/coalescer, an explicit *tracking-lost* state (Phase 4 defines it), and the absolute mapping's calibration |
-| 6 — Left & right clicks | 🟡 **3/5 + 1 partial** | Left click on pinch rising edge, right click via `is_right_click_gesture` rising edge, shared cooldown; release-then-re-arm works; **suppressed while paused** (Phase 1's `can_emit` gate, including a pinch held across a resume) | Scroll precedence and last-action status; the pinch test is re-implemented inline with an L1 metric instead of `gesture.is_pinch()` |
-| 7 — Two-finger scroll | ⛔ **0/5 + 1 partial** | `pyautogui.scroll()` driven by index-finger delta | Two-finger (index/middle) reference point, horizontal scroll, dead zone, sensitivity config (gain hardcoded `-900`), direction inversion, rate limiting, **click suppression while scrolling** (a pinch while moving both clicks and scrolls) |
-| 8 — Pause/runtime/feedback | 🟡 **3/5 + 1 partial** | `runtime.py` coordinator; configurable keyboard toggle (`toggle_pause_keys`) with paused startup; PAUSED/ACTIVE status on the preview; exception-safe teardown (`try/finally`) | A *tracking-lost* status, the optional gesture pause, and tests for toggle idempotence, recovery and window-close cleanup |
+| 4 — Gesture state machine | ✅ **5/5 (2026-10-10)** | `recognizer.py`: `HandState` (neutral / left pinch / right pinch / two-finger scroll / paused / tracking-lost), `EventKind` + `GestureEvent`, `GestureThresholds`/`Observation`/`GestureUpdate`, `GESTURE_PRIORITY`; thumb–index vs thumb–middle pinch detection from `pinch_distances()` ÷ `hand_scale`; per-pair hysteresis, hold time, cooldown, re-arm (`reset(disarm=True)`), scroll-priority resolution, "no switch without neutral", scroll reference/dead-zone/gain; wired into the runtime via `apply_gestures()` behind `can_emit`, with the paused/tracking states driven by the pause key and the frame loop; 72 new tests (54 recogniser + 18 runtime) | The thresholds are reasoned defaults, not measured against a real hand (Phase 9 owns calibration); horizontal scroll is computed and reported (`GestureEvent.secondary`) but not yet emitted |
+| 5 — Cursor movement | 🟡 **3/5 + 1 partial** | Palm/wrist-relative pointer pipeline (see §2 "Pointer reference") with smoothing, clamp and `min_move_pixels`; **dry-run and real adapters** (`output.py`); **opt-in gate** (starts paused, `--dry-run`); paused/bounds suppression; re-anchor on reacquire; the explicit *tracking-lost* state Phase 4 defined (`HandState.TRACKING_LOST`, emitted once per loss) | A real rate limit/coalescer and the absolute mapping's calibration |
+| 6 — Left & right clicks | 🟡 **3/5 + 1 partial** | Left click, right click (thumb–middle), shared cooldown, release-then-re-arm, **scroll precedence** and last-action suppression — all in the recogniser, whose 72 tests assert exact click counts; **suppressed while paused** (Phase 1's `can_emit` gate and the recogniser's own `PAUSED` state, including a pinch held across a resume); the legacy inline path (L1 pinch test, `is_right_click_gesture`) is still reachable via `--gesture-engine legacy` | Last-action status on the preview (hovering a click's target is not tracked); the legacy path still re-implements the pinch inline |
+| 7 — Two-finger scroll | 🟡 **3/5 + 1 partial** | Two-finger (index+middle) pose with the midpoint as reference, reference reset on entry, dead zone, configurable `scroll_gain` (900) and direction (negative = page down), **click suppression while scrolling** (the pose scrolls instead of clicking); horizontal component computed and reported | Emitting the horizontal component, direction inversion as a config field, and rate limiting; the *legacy* index-finger scroll path is unchanged (and still non-conforming) |
+| 8 — Pause/runtime/feedback | 🟡 **4/5 + 1 partial** | `runtime.py` coordinator; configurable keyboard toggle (`toggle_pause_keys`) with paused startup; PAUSED/ACTIVE **and the live gesture state** on the preview (`f"… fps  {gesture_state}"`); the recogniser's `PAUSED`/`TRACKING_LOST` states, kept in step by `_sync_gesture_pause()` and the no-hand branch; exception-safe teardown (`try/finally`) | The optional *gesture* pause, and tests for toggle idempotence, recovery and window-close cleanup |
 | 9 — Calibration/hardening | ⛔ **0/5 + 1 partial** | `HandMouseConfig` with 9 tunables | Mirroring/margins/sensitivity/hotkey knobs, diagnostics, logging (0 hits), profiling, packaging (`pyproject.toml`), final setup docs |
-| Tests | 112 passing | gesture helpers; config defaults; cursor-move guard; camera error path; the Phase 1 safety suite; the pointer-reference suite (curl must not move the cursor, gain/clamp/deadzone maths, re-anchor, scroll guard); the landmark suite (protobuf conversion, incomplete hands, skeleton pixels); the Phase 3 geometry suite (distances, midpoints, clamping, region mapping); the Phase 3 smoothing suite (EMA + 1-euro behaviour, jitter, latency, tracking-loss reset) | MediaPipe's own detections, the real camera path, and the click/scroll branches beyond those cases |
+| Tests | 184 passing | gesture helpers; config defaults; cursor-move guard; camera error path; the Phase 1 safety suite; the pointer-reference suite (curl must not move the cursor, gain/clamp/deadzone maths, re-anchor, scroll guard — now pinned to `gesture_engine="legacy"`); the landmark suite (protobuf conversion, incomplete hands, skeleton pixels); the Phase 3 geometry suite (distances, midpoints, clamping, region mapping); the Phase 3 smoothing suite (EMA + 1-euro behaviour, jitter, latency, tracking-loss reset); the Phase 4 recogniser suite (54 cases: relative thresholds, hysteresis, hold time, cooldown/re-arm, finger distinction, priority, scroll, tracking loss, pause, determinism) and the Phase 4 runtime suite (18 cases: events reach the adapter, the pause gate, the legacy engine, no pyautogui import) | MediaPipe's own detections, the real camera path, and the legacy click/scroll branches beyond the pinned cases |
 
 **What this means for the next session:**
 
-- **Phases 1–3 are done.** Capture, geometry, mapping, smoothing and the safety layer are all in place and
-  tested, so every remaining phase can be built on a pipeline that cannot hurt the desktop and does not
-  need a camera in the test suite.
-- **Phase 4 is the next real step**, and it is the one that pays off in behaviour: an explicit
-  state machine (neutral / left pinch / right pinch / two-finger scroll / paused / tracking-lost) with
-  hysteresis, hold times and hand-scale-relative thresholds. `hand_scale`, `hand_span`, `pinch_distances`
-  and `midpoints` were added in Phase 3 precisely so Phase 4 can use relative thresholds instead of the
-  absolute ones it has now; the gesture logic is still two booleans and a debounce in `runtime.py`.
-- **Retrofit, don't rewrite.** Each phase so far added a module and switched the runtime over while leaving
-  the previous path reachable (EMA next to One Euro, index reference next to palm, absolute next to
-  relative). Keep doing that: it is what makes the changes reviewable and revertible.
-- **Phases 6–8 still own the rough edges** listed in §2's known gaps: the click path uses an inline L1
-  pinch test instead of `gesture.is_pinch()`, scrolling is still index-finger-driven (now correctly gated
-  on a still hand), and there is no status/teardown work beyond what Phase 1 built.
+- **Phases 1–4 are done.** Capture, geometry, mapping, smoothing, the safety layer and the gesture
+  state machine are in place and tested, so every remaining phase can be built on a pipeline that
+  cannot hurt the desktop and does not need a camera in the test suite.
+- **Phase 5 is the next real step**: it is now the only phase whose deliverable list still has a
+  *missing* item that nothing else covers — a real rate limit/coalescer — plus the absolute mapping's
+  calibration. The tracking-lost suppression it was waiting on exists (`HandState.TRACKING_LOST`).
+- **Retrofit, don't rewrite.** Every phase so far added a module and switched the runtime over while
+  leaving the previous path reachable (EMA next to One Euro, index next to palm, absolute next to
+  relative, `legacy` next to `recognizer`). Keep doing that: it is what makes the changes reviewable
+  and revertible, and it is why the 5 pre-existing gesture tests could be pinned instead of deleted.
+- **Phase 4 changed the default behaviour on purpose** (the gesture map in §2 "Gestures": right click
+  is now thumb–middle, the two-finger pose scrolls instead of right-clicking). The old behaviour is one
+  flag away (`--gesture-engine legacy`) if the user prefers it — but do not flip the default back
+  without being asked.
+- **Phases 7–9 still own the rough edges:** the horizontal scroll component is computed but not
+  emitted, `scroll_gain`'s direction has no config field, there is no logging or packaging, and the
+  recogniser's thresholds are reasoned defaults rather than measured against a real hand.
 
 ---
 
@@ -463,8 +533,36 @@ reset, responsiveness, and coordinate mapping.
 
 ### Phase 4 — Gesture recognition and state machine
 
-**Status: ⛔ 0/5 — nothing exists.** The only gesture state today is two booleans and a timestamp in
-`main.py`. This phase is greenfield; keep it pure (no cv2, no camera, no `time.time()`).
+**Status: ✅ 5/5 complete (2026-10-10).** `kinematic/recognizer.py` holds the whole phase: `HandState`
+(neutral, left pinch, right pinch, two-finger scroll, paused, tracking lost), `GestureEvent`/`EventKind`,
+`GestureThresholds`, `Observation`/`GestureUpdate` and `GESTURE_PRIORITY`. It is pure — no cv2, no
+MediaPipe, no mouse, no wall clock (a test asserts the module never mentions them) — and the runtime
+feeds it from `apply_gestures()` and translates its events, still behind `can_emit`. The phase's own
+verification bar is met: deterministic transition tests with fake timestamps for sustained pinches,
+repeated pinches, ambiguous input, tracking loss and simultaneous gestures.
+
+- Bullet 1 (the six states): `HandState`, driven by the pause key (`set_paused`) and the frame loop.
+- Bullet 2 (thumb/index and thumb/middle pinches): `pinch_distances()` ÷ `hand_scale()`, per pair.
+- Bullet 3 (relative thresholds): `pinch_ratio` 0.40 with `release_ratio` 1.4 — a test feeds the same
+  pose on a 0.10-scale and a 0.20-scale hand and asserts the same outcome.
+- Bullet 4 (hysteresis, cooldowns, hold times, release/re-arm): per-pair engage/release bands, the
+  `hold_seconds` clock, the `cooldown_seconds` window, and `_armed` per pair so a pose that was already
+  held (across a resume or a tracking loss) is consumed instead of queued.
+- Bullet 5 (scroll priority): `GESTURE_PRIORITY` puts the two-finger pose first, and the two-finger
+  pose emits `scroll_begin`/`scroll`/`scroll_end` and no click — verified in the real loop (5 scrolls,
+  0 clicks per clip) as well as in the tests.
+
+**Behaviour change this phase introduced (deliberate — do not revert without being asked):** the
+gesture map changed. A right click is now a thumb–middle pinch (it used to require thumb–index *and*
+index–middle), and the two-finger pose now scrolls (it used to fire a right click). Both are stated in
+§2 "Gestures" along with the evidence; `--gesture-engine legacy` restores the previous behaviour and
+keeps its own 5 pinned regression tests green.
+
+**Evidence:** 72 new tests (54 recogniser cases + 18 runtime cases), 184 in total; `python3
+tools/gesture_trace.py` prints every scripted transition (hold, cooldown, chatter, scroll, tracking
+loss, pause, right pinch) without a camera; and `python3 tools/measure_loop.py --synthetic-hand
+--active --frames 150` with the mouse intercepted counted exactly one click per deliberate tap for the
+pinch poses, 5 scrolls and 0 clicks for the two-finger pose, and 0 moves for the finger-curl input.
 
 - Define neutral, left-pinch, right-pinch, two-finger-scroll, paused, and tracking-lost states.
 - Detect thumb/index and thumb/middle pinches.
@@ -484,10 +582,11 @@ repeated pinches, ambiguous input, tracking loss, and simultaneous gestures.
 
 ### Phase 5 — Cursor movement
 
-**Status: 🟡 3/5 (2026-10-10).** The adapter split landed with Phase 1 (`RealMouseOutput` /
-`RecordingMouseOutput`), cursor output is opt-in (the app starts paused; `--dry-run` emits nothing at all),
-and moves smaller than `min_move_pixels` are skipped rather than issued. What remains: a genuine rate
-limit/coalescer, and suppression on an explicit tracking-lost state, which Phase 4 defines.
+**Status: 🟡 3/5 (updated 2026-10-10).** The adapter split landed with Phase 1 (`RealMouseOutput` /
+`RecordingMouseOutput`), cursor output is opt-in (the app starts paused; `--dry-run` emits nothing at
+all), moves smaller than `min_move_pixels` are skipped, and the tracking-lost suppression the phase was
+waiting on exists now (`HandState.TRACKING_LOST`, emitted once per loss, with the filter and anchor
+reset). What remains: a genuine rate limit/coalescer, and the absolute mapping's calibration.
 
 - Map filtered coordinates to the active screen.
 - Add dry-run and real cursor adapters.
@@ -506,9 +605,12 @@ tracking loss with the recording adapter. Then perform a cautious manual cursor 
 
 ### Phase 6 — Left and right clicks
 
-**Status: 🟡 3/5 + 1 partial.** Rising-edge detection, release-then-re-arm, the cooldown and pause
-suppression all work (§4 covers the held-pinch-across-resume case). What is missing is scroll precedence
-and status feedback; also switch the inline L1 pinch test over to the already-tested `gesture.is_pinch()`.
+**Status: 🟡 3/5 + 1 partial (updated 2026-10-10, after Phase 4).** All five bullets now hold for the
+default engine — left/right clicks are one-shot events from the recogniser, a sustained pinch clicks
+once, release-and-re-arm is enforced (including the `_armed` flag that survives a resume or a tracking
+loss), and clicks are suppressed while scrolling, paused and untracked. What is still missing is
+last-action status on the preview, and the *legacy* engine still computes its pinch inline with an L1
+test instead of `gesture.is_pinch()`.
 
 - Convert gesture transitions into one-shot left/right click events.
 - Prevent repeated clicks during sustained pinches.
@@ -527,9 +629,13 @@ distinction, and suppression rules.
 
 ### Phase 7 — Two-finger scrolling
 
-**Status: ⛔ 0/5 + 1 partial, and the partial one is non-conforming.** Scrolling exists but it is driven
-by the *pointer* finger's movement with a hardcoded gain, so the present behaviour has to be replaced,
-not extended. Treat this as the phase most likely to regress the current UX — verify before switching.
+**Status: 🟡 3/5 + 1 partial (updated 2026-10-10, after Phase 4).** The two-finger gesture now exists and
+is the default: the index/middle **midpoint** is the reference, it resets on scroll entry, the dead zone
+and `scroll_gain` are config fields, direction is documented (hand down = page down), and the pose is
+suppressed as a click (scroll outranks the clicks by construction). **Horizontal movement is not yet
+implemented end to end**: the recogniser computes and reports it (`GestureEvent.secondary`) but the
+runtime only emits the vertical amount. Direction inversion as a config field and rate limiting are also
+missing, and the legacy index-finger path is unchanged (still non-conforming).
 
 - Use the index/middle pinch midpoint or another documented reference point.
 - Support vertical and horizontal movement.
@@ -548,10 +654,13 @@ sequences with recorded scroll events.
 
 ### Phase 8 — Pause, runtime, and feedback
 
-**Status: 🟡 3/5 + 1 partial (2026-10-10).** Phase 1 built the coordinator and the pause path: a
-configurable keyboard toggle, paused startup, PAUSED/ACTIVE feedback on the preview, and cleanup in a
-`finally` block that also runs when the loop raises. Remaining: tracking-lost status, the optional gesture
-pause, and explicit tests for toggle idempotence, recovery and window-close teardown.
+**Status: 🟡 4/5 + 1 partial (updated 2026-10-10, after Phase 4).** Phase 1 built the coordinator and the
+pause path: a configurable keyboard toggle, paused startup, PAUSED/ACTIVE feedback on the preview, and
+cleanup in a `finally` block that also runs when the loop raises. Phase 4 added the status content the
+phase asked for — the live gesture state (`neutral`, `left_pinch`, `two_finger_scroll`,
+`tracking_lost`, `paused`) is drawn next to the loop rate, and `_sync_gesture_pause()` keeps the state
+machine honest when the pause key is used. Remaining: the optional *gesture* pause, and explicit tests
+for toggle idempotence, recovery and window-close teardown.
 
 - Add a configurable keyboard toggle, with startup paused.
 - Optionally add a gesture pause only after the keyboard control is reliable.
@@ -615,6 +724,19 @@ tracking, sustained gestures, repeated launch/cleanup, and full regression check
 - **Filters are pure and timestamp-driven**: they take the timestamp as an argument, own no clock, hold
   resettable state, and never touch the mouse. A filter that cannot be reset is a filter that will glide
   after a tracking loss.
+- **Gesture logic is one pure module plus one translation point.** `recognizer.py` decides (states,
+  priority, hysteresis, hold/cooldown, re-arm) and never sees a mouse; `runtime.apply_gestures()` is the
+  only place that turns a `GestureEvent` into an adapter call, and it checks `can_emit` first. Adding a
+  gesture means adding an event kind and a state — not touching the pointer path.
+- **One pose means one thing.** Poses are resolved by an explicit `GESTURE_PRIORITY` order (scroll,
+  then left, then right) rather than by whichever comparison happens to run first, so the old "this
+  pose clicks *and* scrolls" overlap cannot come back.
+- **Every gesture rule is stated as a number in the config** (`pinch_ratio`, `pinch_release_ratio`,
+  `pinch_hold_seconds`, `click_cooldown_seconds`, `scroll_deadzone_ratio`, `scroll_gain`) and enforced in
+  the pure module, so a rule can be changed and regression-tested without a camera.
+- **Behaviour changes ship with a switch, not a delete.** `gesture_engine` selects `recognizer`
+  (default) or `legacy`; the old path keeps its tests. Same discipline as EMA/One-Euro, palm/index and
+  absolute/relative.
 
 ---
 
@@ -721,3 +843,22 @@ Observed 2026-10-10: a clone-verification run of `python3 -m kinematic.main` rea
 on the user's machine and then exited 0 with no `q` keypress and no traceback — the exit path is not
 explained by the code (the only `break` is on `ord("q")`). Treat that as an open question, and as another
 argument for Phase 1's explicit pause/quit and Phase 8's exception-safe teardown.
+
+**8.10 Do not write timing tests with a step equal to the threshold.** `0.12 - 0.04` is
+`0.07999999999999999` in binary floating point, so a recogniser test that advances 0.04 s per frame and
+asserts the 0.08 s hold time has elapsed lands one frame late and looks like a bug in the recogniser.
+The Phase 4 tests step 0.05 s (three frames = 0.10 s, comfortably past 0.08) and use exact binary
+fractions (0.5625, 0.625) for the boundary assertion itself. The same trap applies to
+`tools/gesture_trace.py`'s scripted sequences: give each pose enough frames, or it silently never
+commits.
+
+**8.11 A state machine that can re-enter its own transition gets stuck.** The recogniser's first
+version left `HandState.TRACKING_LOST` only when something else committed, so a reacquired hand stayed
+"lost" and the restore branch fired every frame — resetting the pending pose before it could ever hold,
+which made *every* gesture dead after a tracking loss. Three bugs of this shape were found by the
+Phase 4 tests, all in the same class: (1) the state must leave `TRACKING_LOST` explicitly on the
+restore frame; (2) a pair disarmed by a restore/tracking-loss must re-arm when it is *observed*
+disengaged, not only on a release transition, or a hand held open can never pinch again; (3) the
+per-pair `_armed` flag is what makes "a pinch held across a resume is consumed" true, and it has to be
+set on the fire path *and* on a suppressed click. When adding a transition, ask what clears it — if the
+answer is "another gesture", it is wrong.

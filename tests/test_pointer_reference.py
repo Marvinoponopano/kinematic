@@ -165,7 +165,7 @@ class CurlDoesNotMoveTheCursorTests(unittest.TestCase):
 
     def test_pinching_while_the_hand_holds_still_only_clicks(self):
         output = RecordingMouseOutput()
-        runtime = make_runtime(output)
+        runtime = make_runtime(output, gesture_engine="legacy")  # the inline click path
         runtime.process_landmarks(build_hand(pinched=False), now=0.0)
         runtime.process_landmarks(build_hand(pinched=True), now=1.0)
 
@@ -259,9 +259,16 @@ class HandTranslationMovesTheCursorTests(unittest.TestCase):
 
 
 class ScrollDoesNotFightThePointerTests(unittest.TestCase):
+    """The legacy index-finger scroll path, pinned to ``gesture_engine="legacy"``.
+
+    From Phase 4 on, scrolling is the two-finger gesture owned by the recogniser (see
+    tests/test_phase4_recognizer.py and tests/test_phase4_runtime.py); this class keeps the old path
+    — including its still-hand guard — under regression test, because it is still reachable.
+    """
+
     def test_index_finger_still_scrolls_while_the_hand_holds_still(self):
         output = RecordingMouseOutput()
-        runtime = make_runtime(output)
+        runtime = make_runtime(output, gesture_engine="legacy")
         runtime.process_landmarks(build_hand(index_drop=0.0))
         runtime.process_landmarks(build_hand(index_drop=0.10))  # index finger sweeps down
 
@@ -270,7 +277,7 @@ class ScrollDoesNotFightThePointerTests(unittest.TestCase):
 
     def test_scrolling_is_suppressed_while_the_hand_is_translating(self):
         output = RecordingMouseOutput()
-        runtime = make_runtime(output)
+        runtime = make_runtime(output, gesture_engine="legacy")
         runtime.process_landmarks(build_hand())
         runtime.process_landmarks(build_hand(offset=(0.04, 0.0), index_drop=0.10))
 
@@ -279,7 +286,7 @@ class ScrollDoesNotFightThePointerTests(unittest.TestCase):
 
     def test_guard_can_be_disabled(self):
         output = RecordingMouseOutput()
-        runtime = make_runtime(output, scroll_requires_still_hand=False)
+        runtime = make_runtime(output, scroll_requires_still_hand=False, gesture_engine="legacy")
         runtime.process_landmarks(build_hand())
         runtime.process_landmarks(build_hand(offset=(0.04, 0.0), index_drop=0.10))
         self.assertEqual(len(output.scrolls), 1)

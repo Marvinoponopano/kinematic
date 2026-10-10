@@ -46,13 +46,15 @@ class SyntheticHands:
     bug's input, kept here so the fix can be demonstrated on demand.
     """
 
-    def __init__(self, real=None, translate: bool = True) -> None:
+    def __init__(self, real=None, translate: bool = True, tap_period: int = 30, gesture: str = "left") -> None:
         self.real = real
         self.translate = translate
+        self.tap_period = tap_period
+        self.gesture = gesture
         self.calls = 0
 
     @staticmethod
-    def _hand(offset, index_drop, pinch):
+    def _hand(offset, index_drop, pinch_target=None):
         base = (0.5 + offset[0], 0.6 + offset[1])
         points = [(base[0], base[1]) for _ in range(21)]
         points[0] = (base[0], base[1] + 0.02)  # wrist
@@ -65,9 +67,17 @@ class SyntheticHands:
         points[16] = (base[0] + 0.05, base[1] - 0.17)
         points[20] = (base[0] + 0.09, base[1] - 0.15)
         thumb = (base[0] - 0.13, base[1] - 0.03)
-        if pinch:
+        if pinch_target == "left":  # left click: thumb meets the index tip
             tip = points[8]
             thumb = (tip[0] - 0.005, tip[1] + 0.005)
+        elif pinch_target == "right":  # right click: thumb meets the middle tip, index stays away
+            tip = points[12]
+            thumb = (tip[0] - 0.005, tip[1] + 0.005)
+        elif pinch_target == "two_finger":  # scroll: the thumb meets both tips at once
+            middle_of_tips = ((points[8][0] + points[12][0]) / 2.0, (points[8][1] + points[12][1]) / 2.0)
+            thumb = middle_of_tips
+            points[8] = (middle_of_tips[0] - 0.012, middle_of_tips[1])
+            points[12] = (middle_of_tips[0] + 0.012, middle_of_tips[1])
         points[4] = thumb
         return points
 
@@ -82,8 +92,13 @@ class SyntheticHands:
         else:
             offset = (0.0, 0.0)
             index_drop = 0.10 * math.sin(step / 6.0)
+        # A realistic tap: pinched for 6 frames every tap_period (0.2 s of a ~1 s cycle). The
+        # Phase 4 recogniser only registers a pose that holds for pinch_hold_seconds (0.08 s ≈ 2.4
+        # frames at 30 fps), so a single-frame pinch is deliberately ignored.
+        pinching = (step % self.tap_period) < 6
+        pinch_target = self.gesture if pinching else None
         landmarks = [
-            SimpleNamespace(x=x, y=y, z=0.0) for x, y in self._hand(offset, index_drop, step % 10 == 0)
+            SimpleNamespace(x=x, y=y, z=0.0) for x, y in self._hand(offset, index_drop, pinch_target)
         ]
         return SimpleNamespace(multi_hand_landmarks=[SimpleNamespace(landmark=landmarks)])
 
@@ -114,6 +129,18 @@ def main() -> int:
         default=None,
         help="override which hand point drives the cursor (index reproduces the old drift)",
     )
+    parser.add_argument(
+        "--gesture-engine",
+        choices=("recognizer", "legacy"),
+        default=None,
+        help="override the gesture engine (recognizer is the default; legacy keeps the pre-Phase-4 inline tests)",
+    )
+    parser.add_argument(
+        "--synthetic-pinch",
+        choices=("left", "right", "two_finger"),
+        default="left",
+        help="with --synthetic-hand, which pose the periodic tap uses: left pinch (default), right pinch, or a two-finger pinch (scroll)",
+    )
     args = parser.parse_args()
 
     here = pyautogui.position()
@@ -133,13 +160,19 @@ def main() -> int:
         overrides["pointer_mode"] = args.pointer_mode
     if args.pointer_reference is not None:
         overrides["pointer_reference"] = args.pointer_reference
+    if args.gesture_engine is not None:
+        overrides["gesture_engine"] = args.gesture_engine
     config = HandMouseConfig(**overrides)
     app = HandMouseApp(config)
     seen = {"n": 0}
     stamps = []
     real_process = app.runtime.hands.process
     if args.synthetic_hand:
-        app.runtime.hands = SyntheticHands(real_process, translate=not args.fingers_only)
+        app.runtime.hands = SyntheticHands(
+            real_process,
+            translate=not args.fingers_only,
+            gesture=args.synthetic_pinch,
+        )
         real_process = app.runtime.hands.process
 
     def process(rgb, _real=real_process, _seen=seen, _stamps=stamps):
@@ -164,6 +197,7 @@ def main() -> int:
     print(f"measured span    : {span:.2f} s")
     print(f"loop rate        : {fps:.2f} fps internal (app reports {app.loop_fps:.2f})")
     print(f"pointer          : mode={app.config.pointer_mode} reference={app.config.pointer_reference}")
+    print(f"gestures         : engine={app.config.gesture_engine} state={app.gesture_state.value}")
     print(f"status           : {app.status}")
     print(f"mouse calls kept away from the OS: {calls}")
     app.close()

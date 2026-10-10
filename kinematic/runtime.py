@@ -37,6 +37,15 @@ from .gesture import (
 )
 from .mapping import Region, map_point_to_screen
 from .output import MouseOutput, RealMouseOutput, RecordingMouseOutput
+from .recognizer import (
+    EventKind,
+    GestureEvent,
+    GestureRecognizer,
+    GestureUpdate,
+    HandState,
+    Observation,
+    thresholds_from_config,
+)
 from .smoothing import CursorFilter, filter_from_config
 
 
@@ -76,6 +85,12 @@ class HandMouseRuntime:
         self.emitted = 0
         self.paused = bool(self.config.start_paused)
 
+        # Phase 4: the pure recogniser owns gesture state; the runtime only translates events.
+        self.gesture = GestureRecognizer(thresholds_from_config(self.config))
+        self.gesture.set_paused(self.paused)
+        self.gesture_state: HandState = self.gesture.state
+        self.last_gesture_events: Tuple[GestureEvent, ...] = ()
+
     # -- construction helpers -------------------------------------------------
 
     def _default_output(self) -> MouseOutput:
@@ -104,15 +119,27 @@ class HandMouseRuntime:
 
     def pause(self) -> bool:
         self.paused = True
+        self._sync_gesture_pause()
         return self.paused
 
     def resume(self) -> bool:
         self.paused = False
+        self._sync_gesture_pause()
         return self.paused
 
     def toggle_pause(self) -> bool:
         self.paused = not self.paused
+        self._sync_gesture_pause()
         return self.paused
+
+    def _sync_gesture_pause(self) -> None:
+        """Tell the recogniser about a pause/resume so its state machine stays truthful.
+
+        The recogniser drops any gesture in flight here, which is what stops a pinch held
+        across a resume from clicking — the rising edge belonged to the paused period.
+        """
+        self.gesture.set_paused(self.paused)
+        self.gesture_state = self.gesture.state
 
     def handle_key(self, key: int) -> bool:
         """Act on a ``cv2.waitKey()`` code. Returns True when the loop should stop."""
@@ -264,6 +291,43 @@ class HandMouseRuntime:
         self.last_index = index_tip
         return scrolled
 
+    # -- Phase 4: the gesture state machine -----------------------------------
+
+    def apply_gestures(self, landmarks: Any, now: Optional[float] = None) -> int:
+        """Run the pure recogniser for one frame and translate its events into output calls.
+
+        The recogniser decides *what* the hand is doing — states, priority, hysteresis, hold
+        and cooldown rules — and holds no reference to the mouse. This method is the only
+        place that turns an event into a desktop side effect, and it still obeys ``can_emit``.
+        ``landmarks=None`` means tracking was lost this frame.
+        """
+        now = time.monotonic() if now is None else now
+        update = self.gesture.update(Observation(landmarks=landmarks, timestamp=now))
+        self.gesture_state = update.state
+        self.last_gesture_events = update.events
+        return self._apply_gesture_events(update)
+
+    def _apply_gesture_events(self, update: GestureUpdate) -> int:
+        emitted = 0
+        for event in update.events:
+            if not self.can_emit:
+                break
+            if event.kind is EventKind.LEFT_CLICK:
+                self.output.click("left")
+            elif event.kind is EventKind.RIGHT_CLICK:
+                self.output.click("right")
+            elif event.kind is EventKind.SCROLL:
+                amount = int(event.value)
+                if amount == 0:
+                    continue
+                self.output.scroll(amount)
+            else:
+                # scroll_begin/scroll_end, tracking and pause events are state bookkeeping.
+                continue
+            self.emitted += 1
+            emitted += 1
+        return emitted
+
     def process_landmarks(self, landmarks, now: Optional[float] = None) -> int:
         """Drive the cursor/click/scroll path from one frame's landmarks.
 
@@ -292,8 +356,14 @@ class HandMouseRuntime:
         else:
             emitted += int(self.update_cursor_relative(reference, hand_size, now=now))
 
-        emitted += int(self.handle_clicks(index_tip, thumb_tip, now=now))
-        emitted += int(self.handle_scroll(index_tip, hand_moving=hand_moved))
+        if self.config.gesture_engine == "recognizer":
+            # Phase 4: the recogniser owns the gesture path (priority, hysteresis, hold and
+            # cooldown rules). The legacy inline booleans stay reachable via
+            # config.gesture_engine == "legacy".
+            emitted += self.apply_gestures(landmarks, now=now)
+        else:
+            emitted += int(self.handle_clicks(index_tip, thumb_tip, now=now))
+            emitted += int(self.handle_scroll(index_tip, hand_moving=hand_moved))
         return emitted
 
     def process_frame(self, frame: np.ndarray, now: Optional[float] = None) -> int:
@@ -317,6 +387,10 @@ class HandMouseRuntime:
             self.last_pinch = False
             self.last_right_click = False
             emitted = 0
+            if self.config.gesture_engine == "recognizer":
+                # The recogniser models tracking loss itself and reports the transition once;
+                # the tracking events carry no output, so this stays 0.
+                emitted = self.apply_gestures(None, now=now)
 
         self.frames += 1
         return emitted
@@ -342,7 +416,7 @@ class HandMouseRuntime:
                 size = f"  {width}x{height}"
             cv2.putText(
                 preview,
-                f"{self.loop_fps:4.1f} fps{size}",
+                f"{self.loop_fps:4.1f} fps{size}  {self.gesture_state.value}",
                 (8, 22),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.55,

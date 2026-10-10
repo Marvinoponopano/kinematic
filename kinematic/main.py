@@ -109,6 +109,12 @@ def parse_args(argv: Optional[list] = None) -> argparse.Namespace:
         default=None,
         help="cursor filter: one_euro (default, less lag at the same jitter) or ema (the previous fixed-factor filter)",
     )
+    parser.add_argument(
+        "--gesture-engine",
+        choices=("recognizer", "legacy"),
+        default=None,
+        help="gesture logic: recognizer (default, relative thresholds + state machine) or legacy (the pre-Phase-4 inline pinch/scroll tests)",
+    )
     return parser.parse_args(argv)
 
 
@@ -128,6 +134,8 @@ def build_config(args: argparse.Namespace) -> HandMouseConfig:
         overrides["pointer_reference"] = args.pointer_reference
     if args.smoothing_mode is not None:
         overrides["smoothing_mode"] = args.smoothing_mode
+    if args.gesture_engine is not None:
+        overrides["gesture_engine"] = args.gesture_engine
     return HandMouseConfig(**overrides)
 
 
@@ -143,6 +151,13 @@ def main(argv: Optional[list] = None) -> int:
         f"sensitivity={runtime.config.pointer_sensitivity} "
         f"deadzone={runtime.config.pointer_deadzone} "
         f"smoothing={runtime.config.smoothing_mode}"
+    )
+    print(
+        f"kinematic: gestures engine={runtime.config.gesture_engine} "
+        f"pinch_ratio={runtime.config.pinch_ratio} "
+        f"hold={runtime.config.pinch_hold_seconds}s "
+        f"cooldown={runtime.config.click_cooldown_seconds}s "
+        f"scroll_gain={runtime.config.scroll_gain}"
     )
     if runtime.paused:
         print("kinematic: paused at startup - press SPACE in the preview window to control the mouse, ESC or q to quit")
