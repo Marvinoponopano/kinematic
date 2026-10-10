@@ -44,8 +44,8 @@ python3 kinematic/main.py
 nothing to the mouse until you press `SPACE` (or `p`). After that it moves the pointer with your hand,
 left-clicks on a thumb–index pinch, right-clicks on a thumb–middle pinch and scrolls with a two-finger
 pinch. `ESC` or `q` quits. The preview shows `PAUSED` / `ACTIVE`, the live loop rate, the current
-gesture state (`neutral`, `left_pinch`, `tracking_lost`, …) and the detected hand skeleton in its
-top-left corner.
+gesture state (`neutral`, `left_pinch`, `tracking_lost`, …), the sensitivity dial's value and the
+detected hand skeleton, all in its top-left corner.
 
 ```bash
 python3 -m kinematic.main --active      # start controlling the mouse immediately
@@ -55,6 +55,32 @@ python3 -m kinematic.main --no-preview  # no window (quit with Ctrl-C)
 
 Nothing is emitted while paused, and `--dry-run` swaps the real output adapter for a recording one, so
 that mode needs no Accessibility permission and is safe to run anywhere.
+
+## Sensitivity — the dial
+
+How far the cursor moves for a given hand movement is adjustable **while the app runs**, from the
+preview window's keyboard. No restart, no config file, no UI:
+
+| Key | Effect |
+| --- | --- |
+| `]` or `=` or `+` | one notch **faster** |
+| `[` or `-` or `_` | one notch **slower** |
+| `0` | back to the value you started with |
+
+The current setting is drawn on the preview — `sens  5.00 [#####-----]  ] faster  [ slower  0 reset` —
+as the value plus a log-scale bar (each notch is ×1.15, so the bar moves evenly wherever you are). The
+range is 0.5 (very slow) to 60 (very fast) and it clamps at the ends rather than wrapping.
+
+```bash
+python3 -m kinematic.main --sensitivity 8          # start faster than the default 5.0
+python3 -m kinematic.main --sensitivity-step 1.3   # coarser dial: 30% per notch
+```
+
+`pointer_sensitivity` means *screen widths of cursor travel per frame width of hand travel*: at the
+default 5.0, moving your hand across 20% of the frame crosses the screen once. Tune it in the moment
+until pointing feels right — turning the dial never moves the cursor by itself and never makes it jump,
+and the value you end up at is printed when the app exits (pass `--sensitivity` to start a later
+session at the same place).
 
 ## Gestures
 
@@ -133,7 +159,9 @@ Which hand point is used, how fast the pointer moves and how much hand jitter is
 `HandMouseConfig` (`pointer_reference`, `pointer_sensitivity`, `pointer_deadzone`,
 `relative_scale_by_hand`). `pointer_deadzone` is worth tuning for your own hands and camera:
 `python3 tools/measure_stability.py --seconds 15` reports the per-frame wrist/palm jitter in your setup
-next to the configured deadzone (it only reads landmarks — it cannot move your mouse).
+next to the configured deadzone (it only reads landmarks — it cannot move your mouse). How far the
+cursor travels per unit of hand movement is on the dial — see [Sensitivity](#sensitivity--the-dial)
+above, or set `pointer_sensitivity` directly.
 
 ## Performance
 
@@ -173,6 +201,11 @@ on `HandMouseConfig`, so it can be tuned without touching the loop:
 | `show_preview` | `True` | `False` drops the ~14 ms display cost (then quit with Ctrl-C, not `q`) |
 | `show_fps` | `True` | draw the loop rate on the preview |
 | `smoothing` | `0.35` | EMA factor; raise it for a snappier pointer, lower it for less jitter |
+| `pointer_sensitivity` | `5.0` | cursor travel per unit of hand travel — the dial's value (see above) |
+| `sensitivity_step` | `1.15` | how much one notch of the dial changes it, as a multiplier |
+| `sensitivity_min` / `sensitivity_max` | `0.5` / `60.0` | the ends of the dial; the value clamps here |
+| `sensitivity_keys_up` / `_down` / `_reset` | `= + ]` / `- _ [` / `0` | which keys turn the dial |
+| `show_sensitivity` | `True` | draw the dial's value and bar on the preview |
 | `capture_width` / `capture_height` / `capture_fps` / `capture_buffer_size` | 1280 / 720 / 30 / 1 | what is requested from the camera |
 
 ## Requirements
@@ -203,7 +236,7 @@ move.
 python3 -m unittest discover -s tests
 ```
 
-Run from the repository root (the tests import `kinematic.gesture`). **184 tests**, none of which can
+Run from the repository root (the tests import `kinematic.gesture`). **222 tests**, none of which can
 touch your mouse, camera or display: they inject a recording output adapter, fake landmarks and fake
 timestamps. They cover the pure gesture geometry, the capture/control loop, the Phase 1 safety layer
 (paused startup, no output while paused, adapters, keys), the landmark conversion and preview drawing,

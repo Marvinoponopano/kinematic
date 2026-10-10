@@ -110,6 +110,18 @@ def parse_args(argv: Optional[list] = None) -> argparse.Namespace:
         help="cursor filter: one_euro (default, less lag at the same jitter) or ema (the previous fixed-factor filter)",
     )
     parser.add_argument(
+        "--sensitivity",
+        type=float,
+        default=None,
+        help="pointer gain to start with: screen widths of cursor travel per frame width of hand travel (default 5.0)",
+    )
+    parser.add_argument(
+        "--sensitivity-step",
+        type=float,
+        default=None,
+        help="how much one turn of the dial changes the gain, as a multiplier (default 1.15); turn it with ] and [ in the preview, 0 resets",
+    )
+    parser.add_argument(
         "--gesture-engine",
         choices=("recognizer", "legacy"),
         default=None,
@@ -136,6 +148,10 @@ def build_config(args: argparse.Namespace) -> HandMouseConfig:
         overrides["smoothing_mode"] = args.smoothing_mode
     if args.gesture_engine is not None:
         overrides["gesture_engine"] = args.gesture_engine
+    if args.sensitivity is not None:
+        overrides["pointer_sensitivity"] = args.sensitivity
+    if args.sensitivity_step is not None:
+        overrides["sensitivity_step"] = args.sensitivity_step
     return HandMouseConfig(**overrides)
 
 
@@ -159,6 +175,12 @@ def main(argv: Optional[list] = None) -> int:
         f"cooldown={runtime.config.click_cooldown_seconds}s "
         f"scroll_gain={runtime.config.scroll_gain}"
     )
+    print(
+        f"kinematic: sensitivity {runtime.sensitivity:.2f} "
+        f"(range {runtime.config.sensitivity_min}-{runtime.config.sensitivity_max}, "
+        f"{runtime.config.sensitivity_step}x per turn)"
+    )
+    print("kinematic: turn the dial with ] (faster) and [ (slower); 0 resets it to where you started")
     if runtime.paused:
         print("kinematic: paused at startup - press SPACE in the preview window to control the mouse, ESC or q to quit")
     if isinstance(runtime.output, RecordingMouseOutput):
@@ -173,6 +195,10 @@ def main(argv: Optional[list] = None) -> int:
         print(
             f"kinematic: frames={summary['frames']} output_calls={summary['emitted']} "
             f"loop_fps={summary['loop_fps']} status={summary['status']}"
+        )
+        print(
+            f"kinematic: sensitivity ended at {summary['sensitivity']} "
+            f"(started at {summary['sensitivity_start']}, turned {summary['sensitivity_changes']}x)"
         )
         if summary["recorded"]:
             print(f"kinematic: recorded (not sent) {summary['recorded']}")

@@ -174,11 +174,12 @@ class RuntimeUsesTheInternalRepresentationTests(unittest.TestCase):
         runtime.config.preview_scale = 0.5
         runtime.config.show_fps = False
         runtime.config.show_landmarks = False
+        runtime.config.show_sensitivity = False  # the dial is its own overlay (added later)
         runtime.process_frame(np.zeros((240, 320, 3), dtype=np.uint8))
 
         preview = runtime.draw_preview(np.zeros((240, 320, 3), dtype=np.uint8), camera=None)
 
-        self.assertEqual(int(preview.sum()), 0, "nothing should be drawn when the overlay is off")
+        self.assertEqual(int(preview.sum()), 0, "nothing should be drawn when every overlay is off")
 
 
 if __name__ == "__main__":

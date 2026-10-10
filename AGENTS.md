@@ -56,6 +56,7 @@ kinematic/
     ├── test_phase3_smoothing.py  # 21 cases: EMA + 1-euro behaviour, jitter, latency, reset
     ├── test_phase4_recognizer.py # 54 cases: transitions, hysteresis, hold/cooldown/re-arm, priority, scroll
     ├── test_phase4_runtime.py    # 18 cases: the recogniser wired in, the pause gate, the legacy engine
+    ├── test_sensitivity_dial.py  # 38 cases: the pointer-gain dial, its keys, its bar, its wiring
     └── test_pointer_reference.py # 21 cases: wrist/palm reference, curl must not move the cursor, scroll guard
 tools/
 ├── compare_smoothing.py         # seeded jitter-vs-lag comparison of the cursor filters
@@ -79,11 +80,13 @@ python3 -m kinematic.main --pointer-reference wrist    # use the wrist joint ins
 python3 -m kinematic.main --pointer-mode absolute      # old position-mapped pointing
 python3 -m kinematic.main --smoothing-mode ema         # the pre-Phase-3 fixed-factor filter
 python3 -m kinematic.main --gesture-engine legacy      # the pre-Phase-4 inline pinch/scroll tests
-python3 -m unittest discover -s tests       # 184 tests, all pass
+python3 -m kinematic.main --sensitivity 8              # start the pointer gain somewhere else (dial: ] / [ / 0)
+python3 -m unittest discover -s tests       # 222 tests, all pass
 python3 tools/compare_smoothing.py          # seeded jitter vs lag table for the cursor filters
 python3 tools/gesture_trace.py              # every scripted pose through the recogniser, transition by transition
 python3 tools/measure_loop.py --synthetic-hand --active --fingers-only   # the finger-curl regression demo
 python3 tools/measure_loop.py --synthetic-hand --active --synthetic-pinch two_finger   # the scroll pose in the real loop
+python3 tools/measure_loop.py --synthetic-hand --active --dial-notches 6  # turn the dial and measure the travel change
 python3 tools/measure_stability.py --seconds 15          # tune pointer_deadzone against your own hand
 ```
 
@@ -317,6 +320,48 @@ still reports **0 moves** over 120 frames, so the pointer fix is unaffected.
 `python3 tools/gesture_trace.py` prints these transitions without a camera: use it to see what a pose
 does and to sanity-check the thresholds against your own hand (`--pinch-ratio`, `--hold`, `--cooldown`).
 
+### The sensitivity dial (added 2026-10-10)
+
+The pointer gain can be changed **while the app is running**, from the preview window's keyboard — no
+restart, no config editing, no UI:
+
+| Key | Effect |
+| --- | --- |
+| `]` `=` `+` | one notch faster (`pointer_sensitivity × sensitivity_step`) |
+| `[` `-` `_` | one notch slower (`÷ sensitivity_step`) |
+| `0` | back to the value the app started with |
+
+The dial is drawn on the preview as a value plus a log-scale bar, e.g. `sens  5.00 [#####-----]  ]
+faster  [ slower  0 reset`, and the startup banner repeats it. All the fields are on
+`HandMouseConfig`: `sensitivity_step` (1.15 per notch — multiplicative, so one turn feels the same at
+either end), `sensitivity_min` / `sensitivity_max` (0.5 → 60, clamped rather than wrapped), the three
+key tuples, and `show_sensitivity` for the overlay.
+
+Programmatic equivalents, for scripts and for anyone driving the app without the window:
+`runtime.sensitivity` (read), `runtime.set_sensitivity(value)` (clamped), `runtime.adjust_sensitivity(n)`
+and `runtime.reset_sensitivity()`. `runtime.summary()` reports the value the session *ended* at, the
+value it started at, and how many times the dial moved.
+
+Why it is safe to turn mid-gesture: the gain multiplies each frame's *hand displacement* before it is
+added to the cursor position (`pointer_target()`), so changing it cannot rescale movement that is
+already on screen — the cursor does not jump, and turning the dial emits nothing.
+
+**Evidence** — `tools/measure_loop.py` turns the dial through the real key handler halfway through a run
+with the mouse intercepted, then reports the mean cursor travel before and after (160 frames each,
+~30 fps):
+
+| Command | Sensitivity | Mean cursor travel |
+| --- | --- | --- |
+| `--dial-notches 6` | 5.000 → **11.565** (2.31×) | 35.2 px → **72.8 px** (2.07×) |
+| `--dial-notches -6` | 5.000 → **2.162** (0.43×) | 35.2 px → **15.4 px** (0.44×) |
+| `--sensitivity 20 --dial-notches -10` | 20.000 → **4.944** (0.25×) | 106.1 px → **35.2 px** (0.33×) |
+
+The travel figures track the gain closely but not exactly: the synthetic hand translates
+sinusoidally, so the frames before and after the turn cover different parts of its sweep (and moves
+under `min_move_pixels` are skipped). The exact relationship — travel = displacement × gain × screen
+width — is pinned by tests in `tests/test_sensitivity_dial.py` (`test_travel_matches_the_documented_units`,
+`test_double_the_gain_doubles_the_travel`, `test_turning_the_dial_mid_motion_does_not_rescale_what_is_already_on_screen`).
+
 ### Phase status — which phases are actually implemented (audited 2026-10-10)
 
 **Phases 1, 2, 3 and 4 are complete (5/5 each).** Before Phase 1 this repo was a prototype that drove
@@ -334,7 +379,7 @@ updated since.
 
 | Phase | Status | Exists | Missing |
 | --- | --- | --- | --- |
-| 1 — Foundation & safety | ✅ **5/5 (2026-10-10)** | Modules split: `capture.py`, `gesture.py`, `output.py` (adapters), `runtime.py` (coordinator), `main.py` (CLI); `requirements.txt`; 184-test suite; **paused startup** with SPACE toggle and ESC/q quit; **`RecordingMouseOutput` mock adapter** used by tests and `--dry-run`; macOS permission docs in README | — |
+| 1 — Foundation & safety | ✅ **5/5 (2026-10-10)** | Modules split: `capture.py`, `gesture.py`, `output.py` (adapters), `runtime.py` (coordinator), `main.py` (CLI); `requirements.txt`; 222-test suite; **paused startup** with SPACE toggle and ESC/q quit; **`RecordingMouseOutput` mock adapter** used by tests and `--dry-run`; macOS permission docs in README | — |
 | 2 — Capture pipeline | ✅ **5/5 (2026-10-10)** | `capture.py`'s threaded `ThreadedCamera` (`isOpened()` error, buffer size, device-error reporting); `cv2.flip` mirroring, BGR→RGB, `mp.solutions.hands`, invalid-frame error, exception-safe teardown (the runtime's `try/finally`); **`landmarks.py`** (Landmark/HandLandmarks, the single protobuf conversion point, incomplete detections flagged); **preview overlay** of the loop rate *and* the 21-point skeleton (`preview.py`, drawn with cv2, `show_landmarks`) | — |
 | 3 — Geometry/mapping/smoothing | ✅ **5/5 (2026-10-10)** | `gesture.py`: distances, `midpoint`/`midpoints`, `pinch_distances`, `hand_scale` + `hand_span`, `clamp`/`clamp_point`, `mirror_point`, EMA; `mapping.py`: `Region` + `map_point_to_screen` (frame region → screen region, clamping, mirroring); `smoothing.py`: EMA + 1-euro filters with `reset()`, wired into the runtime with a tracking-loss reset; 44 deterministic tests for distances, clamping, smoothing, latency and reset | Midpoints are available but not yet *used* by a gesture; One Euro parameters are tuned for this camera rather than for everyone |
 | 4 — Gesture state machine | ✅ **5/5 (2026-10-10)** | `recognizer.py`: `HandState` (neutral / left pinch / right pinch / two-finger scroll / paused / tracking-lost), `EventKind` + `GestureEvent`, `GestureThresholds`/`Observation`/`GestureUpdate`, `GESTURE_PRIORITY`; thumb–index vs thumb–middle pinch detection from `pinch_distances()` ÷ `hand_scale`; per-pair hysteresis, hold time, cooldown, re-arm (`reset(disarm=True)`), scroll-priority resolution, "no switch without neutral", scroll reference/dead-zone/gain; wired into the runtime via `apply_gestures()` behind `can_emit`, with the paused/tracking states driven by the pause key and the frame loop; 72 new tests (54 recogniser + 18 runtime) | The thresholds are reasoned defaults, not measured against a real hand (Phase 9 owns calibration); horizontal scroll is computed and reported (`GestureEvent.secondary`) but not yet emitted |
@@ -342,8 +387,8 @@ updated since.
 | 6 — Left & right clicks | 🟡 **3/5 + 1 partial** | Left click, right click (thumb–middle), shared cooldown, release-then-re-arm, **scroll precedence** and last-action suppression — all in the recogniser, whose 72 tests assert exact click counts; **suppressed while paused** (Phase 1's `can_emit` gate and the recogniser's own `PAUSED` state, including a pinch held across a resume); the legacy inline path (L1 pinch test, `is_right_click_gesture`) is still reachable via `--gesture-engine legacy` | Last-action status on the preview (hovering a click's target is not tracked); the legacy path still re-implements the pinch inline |
 | 7 — Two-finger scroll | 🟡 **3/5 + 1 partial** | Two-finger (index+middle) pose with the midpoint as reference, reference reset on entry, dead zone, configurable `scroll_gain` (900) and direction (negative = page down), **click suppression while scrolling** (the pose scrolls instead of clicking); horizontal component computed and reported | Emitting the horizontal component, direction inversion as a config field, and rate limiting; the *legacy* index-finger scroll path is unchanged (and still non-conforming) |
 | 8 — Pause/runtime/feedback | 🟡 **4/5 + 1 partial** | `runtime.py` coordinator; configurable keyboard toggle (`toggle_pause_keys`) with paused startup; PAUSED/ACTIVE **and the live gesture state** on the preview (`f"… fps  {gesture_state}"`); the recogniser's `PAUSED`/`TRACKING_LOST` states, kept in step by `_sync_gesture_pause()` and the no-hand branch; exception-safe teardown (`try/finally`) | The optional *gesture* pause, and tests for toggle idempotence, recovery and window-close cleanup |
-| 9 — Calibration/hardening | ⛔ **0/5 + 1 partial** | `HandMouseConfig` with 9 tunables | Mirroring/margins/sensitivity/hotkey knobs, diagnostics, logging (0 hits), profiling, packaging (`pyproject.toml`), final setup docs |
-| Tests | 184 passing | gesture helpers; config defaults; cursor-move guard; camera error path; the Phase 1 safety suite; the pointer-reference suite (curl must not move the cursor, gain/clamp/deadzone maths, re-anchor, scroll guard — now pinned to `gesture_engine="legacy"`); the landmark suite (protobuf conversion, incomplete hands, skeleton pixels); the Phase 3 geometry suite (distances, midpoints, clamping, region mapping); the Phase 3 smoothing suite (EMA + 1-euro behaviour, jitter, latency, tracking-loss reset); the Phase 4 recogniser suite (54 cases: relative thresholds, hysteresis, hold time, cooldown/re-arm, finger distinction, priority, scroll, tracking loss, pause, determinism) and the Phase 4 runtime suite (18 cases: events reach the adapter, the pause gate, the legacy engine, no pyautogui import) | MediaPipe's own detections, the real camera path, and the legacy click/scroll branches beyond the pinned cases |
+| 9 — Calibration/hardening | ⛔ **0/5 + 1 partial** | `HandMouseConfig` with the tunables this phase asks for — camera, margins, smoothing, pinch thresholds, cooldown, hotkeys (`toggle_pause_keys`/`quit_keys`/the dial's key tuples) and sensitivity, now adjustable at **runtime** via the dial (`set_sensitivity`/`adjust_sensitivity`, `]`/`[`/`0`, `--sensitivity`, `--sensitivity-step`) | Mirroring as a config field, diagnostics, logging (0 hits), profiling, packaging (`pyproject.toml`), final setup docs, and the settings-do-not-persist gap: the dial's value is per-session (pass `--sensitivity` to pin it) |
+| Tests | 222 passing | gesture helpers; config defaults; cursor-move guard; camera error path; the Phase 1 safety suite; the pointer-reference suite (curl must not move the cursor, gain/clamp/deadzone maths, re-anchor, scroll guard — now pinned to `gesture_engine="legacy"`); the landmark suite (protobuf conversion, incomplete hands, skeleton pixels); the Phase 3 geometry suite (distances, midpoints, clamping, region mapping); the Phase 3 smoothing suite (EMA + 1-euro behaviour, jitter, latency, tracking-loss reset); the Phase 4 recogniser suite (54 cases) and runtime suite (18 cases); the sensitivity-dial suite (38 cases: clamping, multiplicative notches, the keys, the bar, the CLI flags, cursor travel scaling) | MediaPipe's own detections, the real camera path, and the legacy click/scroll branches beyond the pinned cases |
 
 **What this means for the next session:**
 
@@ -558,7 +603,8 @@ index–middle), and the two-finger pose now scrolls (it used to fire a right cl
 §2 "Gestures" along with the evidence; `--gesture-engine legacy` restores the previous behaviour and
 keeps its own 5 pinned regression tests green.
 
-**Evidence:** 72 new tests (54 recogniser cases + 18 runtime cases), 184 in total; `python3
+**Evidence:** 72 new tests (54 recogniser cases + 18 runtime cases), 184 in total at that point (222
+after the sensitivity dial landed); `python3
 tools/gesture_trace.py` prints every scripted transition (hold, cooldown, chatter, scroll, tracking
 loss, pause, right pinch) without a camera; and `python3 tools/measure_loop.py --synthetic-hand
 --active --frames 150` with the mouse intercepted counted exactly one click per deliberate tap for the
@@ -737,6 +783,11 @@ tracking, sustained gestures, repeated launch/cleanup, and full regression check
 - **Behaviour changes ship with a switch, not a delete.** `gesture_engine` selects `recognizer`
   (default) or `legacy`; the old path keeps its tests. Same discipline as EMA/One-Euro, palm/index and
   absolute/relative.
+- **Live settings are config fields, not a second source of truth.** The sensitivity dial writes
+  `config.pointer_sensitivity` (clamped) through `runtime.set_sensitivity()`, so the config, the
+  preview readout, the CLI flag and the summary always agree; the keys are just a keyboard front end for
+  that one setter. Anything tunable at runtime should follow this shape: one field, one setter, one
+  readout.
 
 ---
 

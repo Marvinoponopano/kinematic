@@ -76,6 +76,26 @@ class HandMouseConfig:
     #   palm-relative pointing, translating the hand would otherwise scroll the page
     #   while it moves the cursor.
 
+    # --- the sensitivity dial -------------------------------------------------
+    sensitivity_step: float = 1.15
+    #   How much one notch of the dial changes pointer_sensitivity: a multiplier, so every
+    #   notch feels the same whether you are at 1.0 or 40.0 (a 15% change per press). Use
+    #   --sensitivity-step or this field for a finer or coarser dial.
+    sensitivity_min: float = 0.5
+    #   The slow end of the dial. 0.5 needs two frame-widths of hand travel to cross the
+    #   screen — slow, but still usable.
+    sensitivity_max: float = 60.0
+    #   The fast end of the dial: about 1.7% of the frame width crosses the whole screen.
+    #   The dial clamps here rather than letting the pointer become uncontrollable.
+    sensitivity_keys_up: Tuple[str, ...] = ("=", "+", "]")
+    #   Keys that turn the dial up (sensitivity_keys_down turns it down), read from the
+    #   preview window's keyboard alongside the pause keys.
+    sensitivity_keys_down: Tuple[str, ...] = ("-", "_", "[")
+    sensitivity_keys_reset: Tuple[str, ...] = ("0",)
+    #   One keypress of the reset restores the startup sensitivity (a detent in the middle
+    #   of the dial), so experimenting is always reversible.
+    show_sensitivity: bool = True
+    #   Draw the dial's current value and position on the preview.
 
     # --- Phase 3: smoothing and screen mapping ------------------------------
     smoothing_mode: str = "one_euro"

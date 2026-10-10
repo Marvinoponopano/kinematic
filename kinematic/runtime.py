@@ -10,6 +10,7 @@ Phase 1 defines this coordinator with the safety behaviour; later phases extend 
 (Phase 5 cursor adapter, Phase 8 status/teardown).
 """
 
+import math
 import time
 from typing import Any, List, Optional, Tuple
 
@@ -91,6 +92,11 @@ class HandMouseRuntime:
         self.gesture_state: HandState = self.gesture.state
         self.last_gesture_events: Tuple[GestureEvent, ...] = ()
 
+        # The sensitivity dial: `sensitivity_start` is the value the app was launched with, so
+        # the reset key always has somewhere to return to.
+        self.sensitivity_start: float = float(self.config.pointer_sensitivity)
+        self.sensitivity_changes: int = 0
+
     # -- construction helpers -------------------------------------------------
 
     def _default_output(self) -> MouseOutput:
@@ -149,7 +155,75 @@ class HandMouseRuntime:
         if char in self.config.toggle_pause_keys:
             self.toggle_pause()
             return False
+        if char in self.config.sensitivity_keys_up:
+            self.adjust_sensitivity(1)
+            return False
+        if char in self.config.sensitivity_keys_down:
+            self.adjust_sensitivity(-1)
+            return False
+        if char in self.config.sensitivity_keys_reset:
+            self.reset_sensitivity()
+            return False
         return char in self.config.quit_keys
+
+    # -- the sensitivity dial -------------------------------------------------
+
+    @property
+    def sensitivity(self) -> float:
+        """Current pointer gain: screen widths of cursor travel per frame width of hand travel."""
+        return float(self.config.pointer_sensitivity)
+
+    def set_sensitivity(self, value: float) -> float:
+        """Set the pointer gain, clamped to the dial's range. Returns the value actually applied.
+
+        Safe to do at any time, including mid-gesture and while paused: the gain is applied to
+        each frame's *displacement*, so changing it never rescales movement that is already on
+        screen — the cursor does not jump, and nothing is emitted by the change itself.
+        """
+        clamped = clamp(float(value), float(self.config.sensitivity_min), float(self.config.sensitivity_max))
+        self.config.pointer_sensitivity = clamped
+        self.sensitivity_changes += 1
+        return clamped
+
+    def adjust_sensitivity(self, notches: int = 1) -> float:
+        """Turn the dial by *notches* (positive = faster, negative = slower). Returns the new value.
+
+        Steps are multiplicative (``sensitivity_step``, 1.15 by default), so one notch feels the
+        same at either end of the dial. Turning past the range stops at the end rather than
+        wrapping or becoming uncontrollable.
+        """
+        if notches == 0:
+            return self.sensitivity
+        step = float(self.config.sensitivity_step)
+        if step <= 0.0:
+            return self.sensitivity
+        if notches > 0:
+            return self.set_sensitivity(self.sensitivity * (step ** notches))
+        return self.set_sensitivity(self.sensitivity / (step ** abs(notches)))
+
+    def reset_sensitivity(self) -> float:
+        """Return the dial to the value the app started with."""
+        return self.set_sensitivity(self.sensitivity_start)
+
+    def sensitivity_bar(self, width: int = 10) -> str:
+        """The dial's position as a compact ASCII bar, on a log scale.
+
+        The range spans 0.5 → 60 (a factor of 120), so a linear bar would look nearly empty at
+        the default 5.0. Log scale puts the default ~6 cells in, which is what a dial should
+        feel like: even turns either side of where you are.
+        """
+        low = float(self.config.sensitivity_min)
+        high = max(float(self.config.sensitivity_max), low * 1.01)
+        value = min(max(self.sensitivity, low), high)
+        span = math.log(high) - math.log(low)
+        position = 0.0 if span <= 0 else (math.log(max(value, low)) - math.log(low)) / span
+        filled = int(round(position * width))
+        filled = min(max(filled, 0), width)
+        return "#" * filled + "-" * (width - filled)
+
+    def sensitivity_text(self) -> str:
+        """One line describing the dial: its value, its position, and the keys that turn it."""
+        return f"sens {self.sensitivity:5.2f} [{self.sensitivity_bar()}]  ] faster  [ slower  0 reset"
 
     # -- per-frame pipeline ---------------------------------------------------
 
@@ -408,6 +482,7 @@ class HandMouseRuntime:
             # Drawn on the preview (scaled or not) so the overlay scales with the window.
             draw_hands(preview, self.current_hands)
 
+        y = 22
         if self.config.show_fps:
             size = ""
             width = getattr(camera, "width", 0)
@@ -417,19 +492,34 @@ class HandMouseRuntime:
             cv2.putText(
                 preview,
                 f"{self.loop_fps:4.1f} fps{size}  {self.gesture_state.value}",
-                (8, 22),
+                (8, y),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.55,
                 (0, 255, 0),
                 1,
                 cv2.LINE_AA,
             )
+            y += 24
+
+        if self.config.show_sensitivity:
+            # The dial: its value, its position on a log bar, and the keys that turn it.
+            cv2.putText(
+                preview,
+                self.sensitivity_text(),
+                (8, y),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.55,
+                (255, 220, 0),
+                1,
+                cv2.LINE_AA,
+            )
+            y += 24
 
         if self.paused:
             cv2.putText(
                 preview,
                 "PAUSED - press SPACE to control the mouse",
-                (8, 46 if self.config.show_fps else 22),
+                (8, y if (self.config.show_fps or self.config.show_sensitivity) else 22),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.55,
                 (0, 165, 255),
@@ -508,6 +598,9 @@ class HandMouseRuntime:
             "loop_fps": round(self.loop_fps, 2),
             "output": type(self.output).__name__,
             "recorded": counts,
+            "sensitivity": round(self.sensitivity, 4),
+            "sensitivity_start": round(self.sensitivity_start, 4),
+            "sensitivity_changes": self.sensitivity_changes,
         }
 
     def close(self) -> None:
