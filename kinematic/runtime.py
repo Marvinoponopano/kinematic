@@ -11,7 +11,7 @@ Phase 1 defines this coordinator with the safety behaviour; later phases extend 
 """
 
 import time
-from typing import Any, Optional, Tuple
+from typing import Any, List, Optional, Tuple
 
 import cv2
 import mediapipe as mp
@@ -19,6 +19,8 @@ import numpy as np
 
 from .capture import ThreadedCamera
 from .config import HandMouseConfig
+from .landmarks import HandLandmarks, hands_from_results
+from .preview import draw_hands
 from .gesture import (
     clamp,
     hand_scale,
@@ -59,7 +61,8 @@ class HandMouseRuntime:
         self.last_pinch = False
         self.last_right_click = False
         self.last_action_at = 0.0
-        self.current_landmarks: list = []
+        self.current_landmarks: Any = []  # the first hand (HandLandmarks) or [] — kept for the facade
+        self.current_hands: List[HandLandmarks] = []
         self.loop_fps = 0.0
         self.frames = 0
         self.emitted = 0
@@ -293,8 +296,13 @@ class HandMouseRuntime:
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         results = self.hands.process(rgb)
 
-        if results.multi_hand_landmarks:
-            emitted = self.process_landmarks(results.multi_hand_landmarks[0].landmark, now=now)
+        # MediaPipe's protobuf is converted exactly once, here at the boundary: everything
+        # below works on the project-owned types in kinematic.landmarks.
+        self.current_hands = hands_from_results(results)
+        hand = next((candidate for candidate in self.current_hands if candidate.is_complete), None)
+
+        if hand is not None:
+            emitted = self.process_landmarks(hand, now=now)
         else:
             self.current_landmarks = []
             self.last_index = None
@@ -312,8 +320,12 @@ class HandMouseRuntime:
         preview = frame
         if self.config.preview_scale != 1.0:
             preview = cv2.resize(frame, None, fx=self.config.preview_scale, fy=self.config.preview_scale)
-        elif self.config.show_fps or self.paused:
+        elif self.config.show_fps or self.config.show_landmarks or self.paused:
             preview = frame.copy()
+
+        if self.config.show_landmarks:
+            # Drawn on the preview (scaled or not) so the overlay scales with the window.
+            draw_hands(preview, self.current_hands)
 
         if self.config.show_fps:
             size = ""

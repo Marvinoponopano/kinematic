@@ -34,6 +34,7 @@ class HandMouseConfig:
     preview_scale: float = 0.5
     show_preview: bool = True
     show_fps: bool = True
+    show_landmarks: bool = True
 
     # --- safety (Phase 1) ---------------------------------------------------
     # The app starts paused: frames are analysed and previewed, but nothing is sent
