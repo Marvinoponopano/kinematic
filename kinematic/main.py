@@ -91,6 +91,18 @@ def parse_args(argv: Optional[list] = None) -> argparse.Namespace:
         help="do not open the preview window (quit with Ctrl-C instead of q)",
     )
     parser.add_argument("--camera", type=int, default=None, help="camera index to open (default: 0)")
+    parser.add_argument(
+        "--pointer-mode",
+        choices=("relative", "absolute"),
+        default=None,
+        help="relative (default): the cursor follows hand displacement; absolute: the cursor maps to the hand's position in the frame",
+    )
+    parser.add_argument(
+        "--pointer-reference",
+        choices=("palm", "wrist", "index"),
+        default=None,
+        help="hand point the cursor follows: palm (default, wrist + knuckles), wrist (most stable), index (legacy fingertip)",
+    )
     return parser.parse_args(argv)
 
 
@@ -104,6 +116,10 @@ def build_config(args: argparse.Namespace) -> HandMouseConfig:
         overrides["show_preview"] = False
     if args.camera is not None:
         overrides["camera_index"] = args.camera
+    if args.pointer_mode is not None:
+        overrides["pointer_mode"] = args.pointer_mode
+    if args.pointer_reference is not None:
+        overrides["pointer_reference"] = args.pointer_reference
     return HandMouseConfig(**overrides)
 
 
@@ -113,6 +129,12 @@ def main(argv: Optional[list] = None) -> int:
     runtime = app.runtime
 
     print(f"kinematic: output={type(runtime.output).__name__} status={runtime.status}")
+    print(
+        f"kinematic: pointer mode={runtime.config.pointer_mode} "
+        f"reference={runtime.config.pointer_reference} "
+        f"sensitivity={runtime.config.pointer_sensitivity} "
+        f"deadzone={runtime.config.pointer_deadzone}"
+    )
     if runtime.paused:
         print("kinematic: paused at startup - press SPACE in the preview window to control the mouse, ESC or q to quit")
     if isinstance(runtime.output, RecordingMouseOutput):

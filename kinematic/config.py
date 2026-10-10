@@ -44,3 +44,34 @@ class HandMouseConfig:
     dry_run: bool = False
     toggle_pause_keys: Tuple[str, ...] = (" ", "p")
     quit_keys: Tuple[str, ...] = ("q", "\x1b")
+
+    # --- pointer reference (added 2026-10-10) --------------------------------
+    # The cursor used to be driven by the index fingertip, so curling or spreading the
+    # fingers dragged it across the screen while the hand itself was still. It is now
+    # driven by the wrist/palm, which barely moves when the fingers do.
+    pointer_mode: str = "relative"
+    #   "relative" (default): the cursor follows *hand displacement*, like a mouse.
+    #       Finger curl contributes nothing because the palm does not move; rotating
+    #       the wrist or moving nearer to the camera does not move the cursor either.
+    #   "absolute": the cursor maps to the hand's position in the frame (the previous
+    #       behaviour, without the fingertip).
+    pointer_reference: str = "palm"
+    #   "palm" (default) = mean of wrist + the four knuckles; "wrist" = wrist joint
+    #   only (most stable); "index" = the legacy fingertip, which finger curl moves.
+    pointer_sensitivity: float = 5.0
+    #   relative mode gain: screen widths of cursor travel per frame width of hand
+    #   travel. 5.0 means crossing the screen takes ~20% of the frame's width of hand
+    #   movement. Raise it to make the pointer quicker.
+    pointer_deadzone: float = 0.003
+    #   Hand displacement (normalized frame units) treated as jitter and held back.
+    #   It accumulates, so slow movement still moves the cursor instead of being lost.
+    relative_scale_by_hand: bool = False
+    #   Divide displacement by the hand's apparent size, so the feel does not change
+    #   when the hand moves nearer to or further from the camera. Off by default
+    #   because it adds landmark noise into the gain.
+    reference_hand_width: float = 0.15
+    #   The hand size assumed by the above, in normalized frame units.
+    scroll_requires_still_hand: bool = True
+    #   Index-finger scrolling only acts while the hand itself is holding still; with
+    #   palm-relative pointing, translating the hand would otherwise scroll the page
+    #   while it moves the cursor.

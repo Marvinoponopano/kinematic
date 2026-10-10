@@ -20,11 +20,19 @@ import numpy as np
 from .capture import ThreadedCamera
 from .config import HandMouseConfig
 from .gesture import (
+    clamp,
+    hand_scale,
     is_right_click_gesture,
+    landmark_point,
     needs_cursor_update,
     normalize_screen_point,
+    point_distance,
+    pointer_delta,
+    pointer_reference_point,
     relative_move_delta,
     smooth_point,
+    INDEX_TIP,
+    THUMB_TIP,
 )
 from .output import MouseOutput, RealMouseOutput, RecordingMouseOutput
 
@@ -47,6 +55,7 @@ class HandMouseRuntime:
         self.screen_w, self.screen_h = self.output.screen_size()
         self.cursor_x, self.cursor_y = self.output.position()
         self.last_index: Optional[Tuple[float, float]] = None
+        self.last_pointer_ref: Optional[Tuple[float, float]] = None
         self.last_pinch = False
         self.last_right_click = False
         self.last_action_at = 0.0
@@ -133,6 +142,66 @@ class HandMouseRuntime:
         self.emitted += 1
         return True
 
+    def hand_is_moving(self, reference: Tuple[float, float]) -> bool:
+        """True when the wrist/palm reference shifted more than the jitter deadzone."""
+        if self.last_pointer_ref is None:
+            return False
+        return point_distance(self.last_pointer_ref, reference) >= self.config.pointer_deadzone
+
+    def pointer_target(
+        self,
+        reference: Tuple[float, float],
+        hand_size: Optional[float] = None,
+    ) -> Optional[Tuple[float, float]]:
+        """Where the cursor should go, from the *displacement* of the hand reference.
+
+        Returns None when there is nothing to do: the first sight of a hand (which only
+        anchors the reference, so the cursor never jumps on reacquire), or a
+        displacement smaller than the jitter deadzone. The anchor is deliberately left
+        alone when the deadzone rejects a frame, so slow movement accumulates instead of
+        being thrown away.
+        """
+        if self.last_pointer_ref is None:
+            self.last_pointer_ref = reference
+            return None
+
+        delta = pointer_delta(self.last_pointer_ref, reference)
+        if self.config.relative_scale_by_hand and hand_size:
+            factor = self.config.reference_hand_width / hand_size
+            delta = (delta[0] * factor, delta[1] * factor)
+
+        if point_distance((0.0, 0.0), delta) < self.config.pointer_deadzone:
+            return None
+        self.last_pointer_ref = reference
+
+        target = (
+            self.cursor_x + delta[0] * self.config.pointer_sensitivity * self.screen_w,
+            self.cursor_y + delta[1] * self.config.pointer_sensitivity * self.screen_h,
+        )
+        return (clamp(target[0], 0.0, self.screen_w), clamp(target[1], 0.0, self.screen_h))
+
+    def update_cursor_relative(
+        self,
+        reference: Tuple[float, float],
+        hand_size: Optional[float] = None,
+        now: Optional[float] = None,
+    ) -> bool:
+        """Relative pointing: shift the cursor by however far the hand itself moved."""
+        target = self.pointer_target(reference, hand_size)
+        if target is None or not self.can_emit:
+            return False
+
+        previous = (self.cursor_x, self.cursor_y)
+        smoothed = smooth_point(previous, target, self.config.smoothing)
+        self.cursor_x, self.cursor_y = smoothed
+
+        if not needs_cursor_update(previous, smoothed, self.config.min_move_pixels):
+            return False
+
+        self.output.move_to(self.cursor_x, self.cursor_y, duration=0)
+        self.emitted += 1
+        return True
+
     def handle_clicks(
         self,
         index_tip: Tuple[float, float],
@@ -163,40 +232,59 @@ class HandMouseRuntime:
 
         return fired
 
-    def handle_scroll(self, index_tip: Tuple[float, float]) -> bool:
+    def handle_scroll(self, index_tip: Tuple[float, float], hand_moving: bool = False) -> bool:
         if self.last_index is None:
             self.last_index = index_tip
             return False
 
         delta_x, delta_y = relative_move_delta(self.last_index, index_tip)
         scrolled = False
-        if abs(delta_y) > self.config.scroll_threshold and self.can_emit:
-            scroll_amount = int(delta_y * -900)
-            if scroll_amount != 0:
-                self.output.scroll(scroll_amount)
-                self.emitted += 1
-                scrolled = True
+        if abs(delta_y) > self.config.scroll_threshold:
+            if self.config.scroll_requires_still_hand and hand_moving:
+                # The hand itself is translating: that is pointing, not scrolling. Keep
+                # the reference current so the delta does not jump when the hand stops.
+                self.last_index = index_tip
+                return False
+            if self.can_emit:
+                scroll_amount = int(delta_y * -900)
+                if scroll_amount != 0:
+                    self.output.scroll(scroll_amount)
+                    self.emitted += 1
+                    scrolled = True
 
         self.last_index = index_tip
         return scrolled
 
     def process_landmarks(self, landmarks, now: Optional[float] = None) -> int:
-        """Drive the cursor/click/scroll path from one frame's landmarks."""
-        self.current_landmarks = landmarks
-        points = [(landmark.x, landmark.y) for landmark in landmarks]
-        index_tip = points[8]
-        thumb_tip = points[4]
+        """Drive the cursor/click/scroll path from one frame's landmarks.
 
-        if self.config.deadzone > 0:
-            dx = abs(index_tip[0] - self.last_index[0]) if self.last_index is not None else 0.0
-            dy = abs(index_tip[1] - self.last_index[1]) if self.last_index is not None else 0.0
-            if dx <= self.config.deadzone and dy <= self.config.deadzone:
-                index_tip = self.last_index if self.last_index is not None else index_tip
+        The cursor reference is the wrist/palm, never the fingertip — see the
+        ``pointer_*`` config fields for why (a curling finger used to drag the cursor).
+        """
+        self.current_landmarks = landmarks
+        index_tip = landmark_point(landmarks, INDEX_TIP)
+        thumb_tip = landmark_point(landmarks, THUMB_TIP)
+
+        reference = pointer_reference_point(landmarks, self.config.pointer_reference)
+        hand_size = hand_scale(landmarks)
+        # Measured before the cursor update, because that is what moves the anchor.
+        hand_moved = self.hand_is_moving(reference)
 
         emitted = 0
-        emitted += int(self.update_cursor(index_tip, now=now))
+        if self.config.pointer_mode == "absolute":
+            anchor = self.last_pointer_ref
+            if self.config.deadzone > 0 and anchor is not None:
+                dx = abs(reference[0] - anchor[0])
+                dy = abs(reference[1] - anchor[1])
+                if dx <= self.config.deadzone and dy <= self.config.deadzone:
+                    reference = anchor
+            self.last_pointer_ref = reference
+            emitted += int(self.update_cursor(reference, now=now))
+        else:
+            emitted += int(self.update_cursor_relative(reference, hand_size, now=now))
+
         emitted += int(self.handle_clicks(index_tip, thumb_tip, now=now))
-        emitted += int(self.handle_scroll(index_tip))
+        emitted += int(self.handle_scroll(index_tip, hand_moving=hand_moved))
         return emitted
 
     def process_frame(self, frame: np.ndarray, now: Optional[float] = None) -> int:
@@ -210,6 +298,7 @@ class HandMouseRuntime:
         else:
             self.current_landmarks = []
             self.last_index = None
+            self.last_pointer_ref = None  # re-anchor on reacquire: the cursor must not jump
             self.last_pinch = False
             self.last_right_click = False
             emitted = 0

@@ -1,7 +1,7 @@
 # AGENTS.md — Kinematic (webcam hand mouse)
 
 Context file for AI coding agents working in this repo. Read this before touching code.
-Last updated: 2026-10-10 (phase status audit added — see §2 "Phase status").
+Last updated: 2026-10-10 (Phase 1 of the roadmap complete — see §2 "Phase status" and §5 Phase 1).
 
 > If your tool looks for a different filename (`CLAUDE.md`, `.cursorrules`, `.windsurfrules`,
 > `.github/copilot-instructions.md`), copy or symlink this file to that name — the content is
@@ -28,27 +28,46 @@ than the default.
 ```
 kinematic/
 ├── .gitattributes
+├── .gitignore
+├── AGENTS.md
 ├── README.md
 ├── requirements.txt
 ├── kinematic/
 │   ├── __init__.py        # re-exports HandMouseConfig, is_pinch, is_right_click_gesture, smooth_point
-│   ├── config.py          # HandMouseConfig dataclass (9 fields)
+│   ├── capture.py         # ThreadedCamera: background-thread grabber handing out the newest frame
+│   ├── config.py          # HandMouseConfig dataclass (9 behavioural + 13 performance + 4 safety fields)
 │   ├── gesture.py         # pure helpers: point_distance, smooth_point, clamp, landmark_points,
-│   │                      #   is_pinch, is_right_click_gesture, relative_move_delta, normalize_screen_point
-│   └── main.py            # HandMouseApp: capture loop + mouse control (monolithic, no seams yet)
+│   │                      #   is_pinch, is_right_click_gesture, relative_move_delta,
+│   │                      #   normalize_screen_point, needs_cursor_update
+│   ├── output.py          # MouseOutput adapters: RealMouseOutput / RecordingMouseOutput (mock)
+│   ├── runtime.py         # HandMouseRuntime: pipeline coordinator + the pause gate on all output
+│   └── main.py            # CLI + HandMouseApp facade over the runtime
 └── tests/
-    └── test_gesture_logic.py   # 4 unittest cases covering gesture.py only
+    ├── test_gesture_logic.py    # 4 cases: pure gesture helpers
+    ├── test_capture_pipeline.py # 9 cases: perf defaults, cursor-move guard, camera error path
+    ├── test_phase1_safety.py    # 19 cases: no output while paused, adapters, keys, no-camera paths
+    └── test_pointer_reference.py # 21 cases: wrist/palm reference, curl must not move the cursor, scroll guard
+tools/
+├── measure_loop.py              # measure the loop rate with the mouse intercepted (nothing moves)
+└── measure_stability.py         # per-frame wrist/palm jitter vs pointer_deadzone (no output adapter at all)
 ```
 
-Git: one commit (`b500351 Initial commit`), only `.gitattributes` and `README.md` are tracked —
-**`kinematic/`, `tests/`, `requirements.txt` are untracked**, and there is no `.gitignore`.
+Git: published as a private repo, `origin` = `github.com/Marvinoponopano/kinematic`, branch `main`.
+Everything above is committed except the changes in the working tree at the time you read this; run
+`git status` before assuming either way.
 
 ### Verified working commands (run from the repo root)
 
 ```bash
-python3 kinematic/main.py            # script invocation (works — see gotcha 8.1)
-python3 -m kinematic.main            # module invocation (documented in README)
-python3 -m unittest discover -s tests   # 4 tests, all pass
+python3 kinematic/main.py                   # starts PAUSED: SPACE controls the mouse, ESC/q quits
+python3 -m kinematic.main                   # same, module invocation (see gotcha 8.1)
+python3 -m kinematic.main --active          # start controlling the mouse straight away
+python3 -m kinematic.main --dry-run --no-preview   # whole pipeline, zero output, headless-safe
+python3 -m kinematic.main --pointer-reference wrist    # use the wrist joint instead of the palm
+python3 -m kinematic.main --pointer-mode absolute      # old position-mapped pointing
+python3 -m unittest discover -s tests       # 53 tests, all pass
+python3 tools/measure_loop.py --synthetic-hand --active --fingers-only   # the finger-curl regression demo
+python3 tools/measure_stability.py --seconds 15          # tune pointer_deadzone against your own hand
 ```
 
 ### Verified interpreter / dependency facts
@@ -62,71 +81,152 @@ python3 -m unittest discover -s tests   # 4 tests, all pass
 | mediapipe | **0.10.14** |
 | pyautogui | 0.9.54 |
 | Screen used in tests | 1710 x 1112 (from `pyautogui.size()`) |
+| Camera | FaceTime camera, negotiates 1280x720 @ 30 fps; **30 fps is a hard ceiling** (see §2 Performance) |
+| Loop rate | 28.8 fps with a hand in frame, 30 fps idle (was 5.8 fps before the performance pass) |
 
 Also present but not used by this project: Homebrew `python3.13` / `python3.14`, `~/.local/bin/python3.11`.
 
 ### Known gaps in the current prototype (read from the code, not yet fixed)
 
-- **Real mouse control is live on startup.** `HandMouseApp.run()` moves the real cursor, clicks and
-  scrolls the moment a hand is seen. No dry-run mode, no pause, no opt-in. This is the biggest
-  safety gap and Phase 1/5/8 of the roadmap close it.
-- **No scroll mode.** `_handle_scroll()` scrolls from *index-finger* movement alone (gain hardcoded
-  `-900`), so moving the pointer scrolls the page. `config.scroll_threshold` is used, but the
-  two-finger scroll gesture does not exist yet.
-- **Duplicated pinch logic.** `_handle_clicks()` computes pinch as a raw L1 distance
-  (`abs(dx)+abs(dy) < click_threshold`) instead of calling the already-imported, unit-tested
-  `gesture.is_pinch()`. Note `is_right_click_gesture()` means *thumb–index AND index–middle* both
+- ~~Real mouse control is live on startup~~ — **fixed in Phase 1.** Every side effect now goes through
+  `HandMouseRuntime` behind the `can_emit` gate, the app starts paused, and `--dry-run` swaps in a
+  recording adapter so the pipeline can run with no desktop side effects at all.
+- ~~The cursor followed the index fingertip~~ — **fixed 2026-10-10.** Fingers curling or spreading
+  dragged the cursor around while the hand itself was still. The cursor now follows the wrist/palm
+  (see §2 "Pointer reference"), so finger articulation cannot move it.
+- **No scroll mode.** `runtime.handle_scroll()` still drives scrolling from *index-finger* movement
+  (gain hardcoded `-900`), but only while the hand itself holds still, so pointing no longer scrolls the
+  page. A real two-finger scroll gesture with a dead zone and sensitivity is still Phase 7.
+- **Duplicated pinch logic.** `runtime.handle_clicks()` computes pinch as a raw L1 distance
+  (`abs(dx)+abs(dy) < click_threshold`) instead of calling the already-tested `gesture.is_pinch()`.
+  Note `is_right_click_gesture()` means *thumb–index AND index–middle* both
   pinched, which is stricter than a "right pinch".
 - **Thresholds are absolute landmark distances**, not relative to hand scale — they drift with
   distance from the camera. Phase 4 replaces them with hand-scale-relative thresholds.
-- **Mapping is not calibrated.** `_update_cursor()` multiplies the normalized point by
-  `pointer_scale = 1.8` and then clamps to the screen, so the reachable region is skewed off-centre.
-- **State is incomplete on tracking loss.** The `else` branch resets `last_index`, `last_pinch`,
-  `last_right_click`, but not the cursor position / smoothing state, so the pointer lurches on reacquire.
-- **No test coverage for `main.py`** (the loop, the mapping, the click emission). Only `gesture.py`
-  is covered.
-- **No packaging** (no `pyproject.toml`), no `.gitignore`, no logging.
-- **Dead helper:** `gesture.clamp()` is defined but never called — `main.py` clamps with bare
-  `min(max(...))` instead. `gesture.is_pinch()` is imported into `main.py` and never called either.
+- **The absolute mapping is not calibrated** (only used with `pointer_mode="absolute"`):
+  `runtime.update_cursor()` multiplies the normalized point by `pointer_scale = 1.8` and clamps to the
+  screen, so the reachable region is skewed off-centre. The default relative mode does not use it.
+- **Tracking loss resets the pointer anchor but not the smoothing state.** A reacquired hand re-anchors
+  instead of jumping (fixed 2026-10-10), and `last_index`/`last_pinch`/`last_right_click` reset, but the
+  smoothed cursor position still carries over, so the first frames after reacquire can glide.
+- **The loop is covered only through fakes.** `runtime.run()` is tested with a fake camera and fake
+  landmarks; MediaPipe's own output, the real camera path and the click/scroll branches are not
+  asserted in the suite (they are exercised manually).
+- **No packaging** (no `pyproject.toml`) and no logging.
+- **Two helpers are dead or duplicated:** `gesture.clamp()` is defined but never called — `runtime.update_cursor()`
+  clamps with bare `min(max(...))` instead — and `gesture.is_pinch()` is exported and tested but unused by
+  the pipeline, which still computes pinch inline with an L1 metric.
+
+### Pointer reference (fixed 2026-10-10)
+
+The cursor used to be mapped from the **index fingertip**, so any finger articulation dragged it across
+the screen even when the hand did not move. It is now driven by the **wrist/palm**, which barely moves
+when the fingers do, and in `relative` mode it moves only by *hand displacement* — so finger curl, wrist
+rotation and changing distance from the camera all leave the cursor where it is.
+
+| Config field | Default | Meaning |
+| --- | --- | --- |
+| `pointer_mode` | `"relative"` | `relative`: the cursor is shifted by how far the hand moved (like a mouse). `absolute`: the cursor maps to the hand's position in the frame |
+| `pointer_reference` | `"palm"` | `palm` = mean of wrist + the four knuckles; `wrist` = the wrist joint alone (most stable); `index` = the old fingertip behaviour |
+| `pointer_sensitivity` | `5.0` | relative gain: screen widths of cursor travel per frame width of hand travel (5.0 ⇒ crossing the screen takes ~20% of the frame width of hand movement) |
+| `pointer_deadzone` | `0.003` | hand displacement below this is treated as jitter and held back (it accumulates, so slow movement is not lost) |
+| `relative_scale_by_hand` | `False` | divide displacement by apparent hand size, so the feel does not change as you move nearer/further from the camera |
+| `scroll_requires_still_hand` | `True` | index-finger scrolling only acts while the hand holds still, so pointing cannot scroll the page |
+
+Measured with `tools/measure_loop.py` (real camera, real MediaPipe, mouse calls intercepted), synthetic
+hand parked with only the index finger moving — the reported bug's input:
+
+| Reference | Cursor moves per 120 frames |
+| --- | --- |
+| `palm` (default) | **0** |
+| `wrist` | **0** |
+| `index` (what the app used to do) | **105** |
+
+And with the whole hand sweeping, the `palm` reference produces 95 moves — the cursor follows deliberate
+hand movement.
+
+Known trade-offs, stated plainly:
+
+- **Relative mode drifts and has no clutch.** Moving the hand back to a comfortable position moves the
+  cursor back with it. `pointer_mode="absolute"` avoids that but needs the frame-to-screen mapping
+  calibrated (still a Phase 3/9 job), and re-anchors nothing.
+- **`pointer_deadzone` is a guess until measured against a real hand.** `tools/measure_stability.py`
+  reports the per-frame jitter of the wrist/palm in your setup next to the configured deadzone; tune the
+  field so it sits above that jitter and below deliberate movement.
+- **MediaPipe gives no separate "hand moved" signal.** The displacement used for the scroll guard is the
+  same measured wrist/palm delta, so a slow deliberate translation below the deadzone still reads as
+  "still".
+
+### Performance (measured 2026-10-10)
+
+Profiled on this machine before optimising. The headline finding: **`pyautogui`'s default `PAUSE = 0.1`
+is slept before every public call**, so each `moveTo`/`click`/`scroll` cost **113 ms instead of 11 ms**.
+
+| Stage | Measured cost | Note |
+| --- | --- | --- |
+| `cap.read()` | 33.5 ms | the camera's frame interval — identical at 1920x1080, 1280x720, 640x480, 320x240, and with 60 fps requested |
+| `pyautogui.moveTo` | **113 ms** with `PAUSE=0.1`, **11.5 ms** with `PAUSE=0` | 100 ms of it is sleep |
+| `pyautogui.click` / `scroll` | 12.7 ms / 11.3 ms | with `PAUSE=0` |
+| `cv2.imshow` + `waitKey` | 20.7 ms full 1080p, 13.9 ms at 0.5 scale | display cost, not vision |
+| MediaPipe `hands.process` | 9.6 ms (complexity 1), 8.1 ms (complexity 0) | **independent of frame size** — it resizes to 256x256 internally |
+| `flip` + `cvtColor` | 0.3 ms at 1080p | negligible |
+
+Result (processed frames per second, measured inside the loop with the same stages either side):
+
+| Scenario | Before | After |
+| --- | --- | --- |
+| hand in frame | **5.77 fps** (173 ms/frame) | **28.80 fps** (34 ms/frame) |
+| idle, no hand | 18.72 fps | 29.98 fps |
+
+The camera's 30 fps is now the limit; no setting raises it (that is a hardware fact, not a code one).
+Changes, all config-driven on `HandMouseConfig`: `mouse_pause`, `min_move_pixels`, `model_complexity`,
+`preview_scale`, plus threaded capture in `capture.py`.
+
+Measuring this correctly matters: timing the loop from outside is wrong — macOS window teardown adds
+~1.5 s, which made a 30 fps loop look like 22 fps. Take frame timestamps **inside** the loop:
+`tools/measure_loop.py` does exactly that and intercepts the mouse calls so nothing on the desktop moves
+(`python3 tools/measure_loop.py`, add `--synthetic-hand --active` to measure the cursor path without
+putting a hand in front of the camera).
 
 ### Phase status — which phases are actually implemented (audited 2026-10-10)
 
-**No phase is complete.** This repo is a *pre-Phase-1 prototype*: it performs real mouse output on
-startup while none of the safety layer that Phase 1 is supposed to establish exists yet. The prototype
-touches the later phases' subject matter (capture, smoothing, clicks, scroll) but not in the shape the
-phases specify.
+**Phase 1 is complete (5/5). Phases 2–9 are not.** Before Phase 1 this repo was a prototype that drove
+the real mouse from startup with none of the safety layer in place; that is fixed — see §5 Phase 1 for
+what landed and the behaviour change it introduced. The later phases' subject matter (capture,
+smoothing, clicks, scroll) is present in the prototype's shape, not in the shape those phases specify,
+so read each phase's own `Status:` line below before starting work.
 
 *How this was audited:* every non-`.git` file was listed and read; the source was grep'd for each
 phase's marker concepts (`pause`, `mock`, `record`, `adapter`, `dry`, `Enum`, `state`, `hyster`,
-`putText`, `fps`, `try:`, `finally`, `logging`, `calibrat`); the deliverable bullets below were checked
-one by one against `kinematic/main.py`, `kinematic/gesture.py`, `kinematic/config.py` and `tests/`;
-and `python3 -m unittest discover -s tests` was run (4 tests, all passing). "0 hits" statements below
-mean the concept does not appear anywhere in `kinematic/` or `tests/`.
+`putText`, `fps`, `try:`, `finally`, `logging`, `calibrat`); the deliverable bullets were checked one by
+one against the package modules; and `python3 -m unittest discover -s tests` was run. The "0 hits" and
+per-phase counts below are from that pre-Phase-1 audit; the Phase 1 row and the Tests row have been
+updated since.
 
 | Phase | Status | Exists | Missing |
 | --- | --- | --- | --- |
-| 1 — Foundation & safety | ⛔ **1/5**, safety **0/5** | `kinematic/` package layout, `config.py`/`gesture.py`/`main.py`, `requirements.txt`, runnable `unittest` suite | Camera/gesture/smoothing/**output modules** (everything is in `main.py`), **paused startup (0 hits)**, **emergency pause/exit (0 hits)**, **mock output adapter (0 hits for mock/record/adapter/dry)**, macOS permission docs (README documents none) |
-| 2 — Capture pipeline | 🟡 **3/5** | `cv2.VideoCapture` + `isOpened()` error, `cv2.flip` mirroring, BGR→RGB, `mp.solutions.hands`, invalid-frame error | Landmark + FPS overlay (`putText`/`fps` = 0 hits), internal landmark representation (raw MediaPipe objects flow straight through), exception-safe cleanup (`try`/`finally` = 0 hits — both `RuntimeError` paths leak the camera handle) |
-| 3 — Geometry/mapping/smoothing | 🟡 **2/5 + 1 partial** | `point_distance`, `smooth_point` (fixed-factor lerp ≈ EMA), `clamp` (uncalled), `landmark_points`, `is_pinch`, `normalize_screen_point`, `relative_move_delta` | Hand-scale calc, midpoints, **configurable screen control region** (`pointer_scale = 1.8` + clamp instead), One Euro smoothing, **filter reset on tracking loss** |
-| 4 — Gesture state machine | ⛔ **0/5** | Only a rising-edge boolean + `debounce_seconds` in `main.py` | States/`Enum` (0 hits), hysteresis, hold times, hand-scale-relative thresholds, pure recognizer with injected timestamp, scroll precedence |
-| 5 — Cursor movement | 🟡 **1/5** | `pyautogui.moveTo(x, y, duration=0)` on smoothed coordinates | Dry-run/recording adapter, opt-in gate (real output is the only mode), rate limiting/coalescing, paused/untracked suppression (those states don't exist) |
-| 6 — Left & right clicks | 🟡 **3/5 + 1 partial** | Left click on pinch rising edge, right click via `is_right_click_gesture` rising edge, shared cooldown; release-then-re-arm works | Scroll precedence, pause suppression, last-action status; pinch is re-implemented inline with an L1 metric — **`is_pinch` is imported and never called** |
+| 1 — Foundation & safety | ✅ **5/5 (2026-10-10)** | Modules split: `capture.py`, `gesture.py`, `output.py` (adapters), `runtime.py` (coordinator), `main.py` (CLI); `requirements.txt`; 53-test suite; **paused startup** with SPACE toggle and ESC/q quit; **`RecordingMouseOutput` mock adapter** used by tests and `--dry-run`; macOS permission docs in README | — |
+| 2 — Capture pipeline | 🟡 **4/5** | `capture.py`'s threaded `ThreadedCamera` (`isOpened()` error, buffer size, device-error reporting), `cv2.flip` mirroring, BGR→RGB, `mp.solutions.hands`, invalid-frame error, exception-safe teardown (the runtime's `try/finally`), loop-rate overlay on the preview | Internal landmark representation (raw MediaPipe objects still flow through) and landmark drawing on the preview |
+| 3 — Geometry/mapping/smoothing | 🟡 **3/5 + 1 partial** | `point_distance`, `smooth_point` (fixed-factor EMA), `clamp` (now used by the pointer clamp), `landmark_points`, `is_pinch`, `normalize_screen_point`, `relative_move_delta`, **`hand_scale`** (wrist→middle knuckle), `wrist_point`/`palm_center`, `pointer_delta`, `needs_cursor_update` | Midpoints, a **configurable screen control region** (relative mode needs none; absolute mode still uses `pointer_scale` + clamp), One Euro smoothing, filter reset on tracking loss |
+| 4 — Gesture state machine | ⛔ **0/5** | Only a rising-edge boolean + `debounce_seconds` in `runtime.py` | States/`Enum` (0 hits), hysteresis, hold times, hand-scale-relative thresholds, pure recognizer with injected timestamp, scroll precedence |
+| 5 — Cursor movement | 🟡 **3/5 + 1 partial** | Palm/wrist-relative pointer pipeline (see §2 "Pointer reference") with smoothing, clamp and `min_move_pixels`; **dry-run and real adapters** (`output.py`); **opt-in gate** (starts paused, `--dry-run`); paused/bounds suppression; re-anchor on reacquire | A real rate limit/coalescer, an explicit *tracking-lost* state (Phase 4 defines it), and the absolute mapping's calibration |
+| 6 — Left & right clicks | 🟡 **3/5 + 1 partial** | Left click on pinch rising edge, right click via `is_right_click_gesture` rising edge, shared cooldown; release-then-re-arm works; **suppressed while paused** (Phase 1's `can_emit` gate, including a pinch held across a resume) | Scroll precedence and last-action status; the pinch test is re-implemented inline with an L1 metric instead of `gesture.is_pinch()` |
 | 7 — Two-finger scroll | ⛔ **0/5 + 1 partial** | `pyautogui.scroll()` driven by index-finger delta | Two-finger (index/middle) reference point, horizontal scroll, dead zone, sensitivity config (gain hardcoded `-900`), direction inversion, rate limiting, **click suppression while scrolling** (a pinch while moving both clicks and scrolls) |
-| 8 — Pause/runtime/feedback | ⛔ **0/5** | Nothing | Pause toggle (`pause` = 0 hits), runtime coordinator, paused/active/tracking-lost status, exception-safe teardown (cleanup only runs on the `q` path) |
+| 8 — Pause/runtime/feedback | 🟡 **3/5 + 1 partial** | `runtime.py` coordinator; configurable keyboard toggle (`toggle_pause_keys`) with paused startup; PAUSED/ACTIVE status on the preview; exception-safe teardown (`try/finally`) | A *tracking-lost* status, the optional gesture pause, and tests for toggle idempotence, recovery and window-close cleanup |
 | 9 — Calibration/hardening | ⛔ **0/5 + 1 partial** | `HandMouseConfig` with 9 tunables | Mirroring/margins/sensitivity/hotkey knobs, diagnostics, logging (0 hits), profiling, packaging (`pyproject.toml`), final setup docs |
-| Tests | helper-only | 4 passing tests: `is_pinch`, `is_right_click_gesture`, `smooth_point`, `point_distance` | `clamp`, `relative_move_delta`, `normalize_screen_point`, and **all of `main.py`** (loop, mapping, click emission, scroll) |
+| Tests | 53 passing | gesture helpers; config defaults; cursor-move guard; camera error path; the Phase 1 safety suite; the pointer-reference suite (curl must not move the cursor, gain/clamp/deadzone maths, re-anchor, scroll guard) | MediaPipe's own detections, the real camera path, and the click/scroll branches beyond those cases |
 
 **What this means for the next session:**
 
-- **Phase 1 is the honest next step, not Phase 2.** Capture, smoothing and clicks mostly exist, but they
-  sit on top of a missing safety layer, and Phase 1 is what makes every later phase testable.
-- **Phase 1 will have to *remove* live behaviour — this is an approved exception to "strictly additive".**
-  Real output must become opt-in behind an adapter; that means changing existing code paths, which rule 3.1
-  otherwise forbids. Keep the old path reachable (e.g. a `real_output=True` flag) so nothing is lost, and
-  state the exception in the phase report. The safety contract in §4 outranks the additive rule here.
-- **Several phases replace rather than extend** (Phase 7's scroll, Phase 4's thresholds, Phase 5's mapping).
-  Add the new module, switch the runtime over, and leave the prototype path intact until the switch is
-  verified — same additive discipline, just with a deliberate hand-off.
+- **Phase 1 is done.** The safety layer exists, so every later phase can be built and tested without
+  risking the user's desktop. Start from §5 Phase 2.
+- **Retrofit, don't rewrite.** The prototype's capture, smoothing, click and scroll behaviour now lives
+  behind `runtime.py`. Later phases should add their own module and switch the runtime over to it, leaving
+  the previous path reachable until the switch is verified — the same additive discipline, just with a
+  deliberate hand-off.
+- **Phases 4, 7 and 8 are the real work.** A gesture state machine, two-finger scrolling and the
+  status/teardown layer do not exist in any form. Phase 7 in particular has to *replace* the current
+  pointer-driven scroll, so treat it as the riskiest change to the existing feel.
 
 ---
 
@@ -172,22 +272,44 @@ Moving a user's real mouse can click destructive things. Every phase must preser
   Accessibility (System Settings → Privacy & Security → Accessibility) for the Terminal/IDE process
   before PyAutoGUI can control the pointer. Document both; diagnose denial in Phase 9.
 
+### How each requirement is enforced today (Phase 1, implemented 2026-10-10)
+
+| Requirement | Mechanism |
+| --- | --- |
+| default to no real output | `HandMouseRuntime` starts paused; `update_cursor`/`handle_clicks`/`handle_scroll` all check `can_emit` and the runtime is the only code that touches a `MouseOutput`. `--dry-run` (or `dry_run=True`) swaps the adapter to `RecordingMouseOutput` |
+| tests never reach the machine | `tests/test_phase1_safety.py` injects `RecordingMouseOutput`, a fake camera and fake hands; the suite needs no camera, no display and no permissions |
+| keyboard pause/resume + emergency quit | SPACE or `p` toggles (`config.toggle_pause_keys`), ESC or `q` quits (`config.quit_keys`), Ctrl-C always works from the terminal. The preview window keeps keyboard focus while the pointer is being driven |
+| suppress output while paused / untracked | paused frames are still analysed and previewed, but nothing is emitted; a pinch already held when the user resumes does **not** click (the rising edge belonged to the paused period) |
+| recovery story for `FAILSAFE` | `FAILSAFE` stays off by default; the documented stop is SPACE to pause, ESC/q to quit, Ctrl-C as the always-available fallback. `RealMouseOutput(failsafe=True)` re-enables pyautogui's corner abort for anyone who wants it |
+
 ---
 
 ## 5. Roadmap
 
-Nine phases. Each phase lists deliverables, the verification bar, and a ready-to-paste prompt. Each
-phase heading also carries a `Status:` line taken from the audited table in §2 — read it before
-starting, because the prototype already covers slices of Phases 2/3/5/6 and none of Phase 1/4/8.
-Phases 1–4 are pure/offline and are the highest-value work first; per the plan real desktop output
-stays disabled until Phase 5 and is opt-in from there on, but note that the *current prototype breaks
-that already* by driving the real cursor the moment it starts.
+Nine phases. Each phase lists deliverables, the verification bar, and a ready-to-paste prompt, and each
+heading carries a `Status:` line taken from the audited table in §2 — read it before starting.
+**Phase 1 is complete**; Phases 2–9 are not, and the prototype already covers slices of 2/3/5/6. Real
+desktop output is no longer live by default: it waits for the SPACE key, per the Phase 1 safety layer.
 
 ### Phase 1 — Project foundation and safety
 
-**Status: ⛔ 1/5, safety 0/4 — do not start Phase 2 before this.** What exists is only bullet 1:
-the package layout, `requirements.txt` and a runnable test suite. No paused startup, no mock output
-adapter, no permission docs; see the §2 table.
+**Status: ✅ 5/5 complete (2026-10-10).** All five deliverables landed. Modules: `capture.py` (camera),
+`gesture.py` (pure geometry/smoothing), `output.py` (mouse adapters), `runtime.py` (coordinator),
+`main.py` (CLI + facade). Safety: the app starts paused with a keyboard toggle and quit keys, and
+`RecordingMouseOutput` is the mock adapter that tests and `--dry-run` use. The README documents the
+macOS Camera and Accessibility permissions.
+
+**Verification evidence** (reproduce with `python3 tools/measure_loop.py`, which intercepts the mouse calls
+and counts them, plus the subprocess check below):
+
+- 32 tests pass, none of which can reach pyautogui: they inject `RecordingMouseOutput`, a fake camera
+  and fake landmarks.
+- Real app, real camera, real MediaPipe, mouse calls counted: **0** calls over 45 frames while paused
+  and **0** with no hand in frame after resuming.
+- Real loop with a synthetic hand: **0** calls over 60 frames while paused, then 36 moves + 4 clicks
+  over 100 frames after pressing SPACE.
+- Real CLI (`python3 kinematic/main.py --dry-run --no-preview`) run as a subprocess for 5 s: exit 0,
+  `frames=110 output_calls=0 loop_fps=30.28`, recorded `{move: 0, click: 0, scroll: 0}`.
 
 - Create the Python environment, dependency manifest, package structure, and test setup.
 - Define camera, gesture, smoothing, runtime, and mouse-output modules.
@@ -204,11 +326,19 @@ mouse events.
 > real mouse-control behavior yet; include a mock output adapter and a no-op startup path, then run
 > the focused tests.
 
+**Behaviour change this phase introduced (do not "fix" it back):** the app used to seize the cursor the
+moment it started. It now starts **paused** — the preview reads
+`PAUSED - press SPACE to control the mouse` — and emits nothing until SPACE (or `p`) is pressed.
+`--active` restores start-immediately, `--dry-run` selects the recording adapter, and `--no-preview`
+runs without a window. This is the one place where Phase 1 deliberately changed existing behaviour at
+runtime; the old code path is still reachable, just not the default.
+
 ### Phase 2 — Webcam and MediaPipe pipeline
 
-**Status: 🟡 3/5 (bullets 1–3 done, caveat on cleanup).** Capture/MediaPipe/mirroring all work, but
-they live inside `main.py` with the mouse control, there is no `try`/`finally` teardown, and the preview
-shows a bare frame. The remaining work is separation + overlay + a landmark type.
+**Status: 🟡 4/5 (2026-10-10).** Capture now lives in `capture.py` as a threaded grabber with device-error
+reporting and a buffer size of 1, the runtime owns teardown (`try/finally`) and the preview overlays the
+loop rate. Missing: an internal landmark representation (raw MediaPipe objects flow straight through) and
+drawing the landmarks on the preview.
 
 - Implement OpenCV camera capture and cleanup.
 - Add MediaPipe hand detection and landmark extraction.
@@ -226,9 +356,11 @@ work without mouse events.
 
 ### Phase 3 — Geometry, mapping, and smoothing
 
-**Status: 🟡 2/5 + 1 partial.** `gesture.py` already holds most of the pure geometry (bullet 1 partial —
-no midpoints or hand scale) and a working fixed-factor EMA (bullet 4). Missing: a configurable screen
-control region and the tracking-loss filter reset. Extend `gesture.py`; don't rewrite it.
+**Status: 🟡 3/5 + 1 partial (2026-10-10).** `gesture.py` holds the pure geometry, including
+`hand_scale` (wrist→middle knuckle) and the wrist/palm reference points, plus a working fixed-factor EMA
+(bullet 4). `relative_move_delta` and the pointer path are in place; the cursors' clamp now uses
+`clamp()`. Missing: midpoints, a configurable screen control region (only the legacy `absolute` mode
+needs one) and the filter reset on tracking loss. Extend `gesture.py`; don't rewrite it.
 
 - Add landmark distances, pinch distances, midpoints, and hand-scale calculations.
 - Normalize index-finger coordinates.
@@ -268,9 +400,10 @@ repeated pinches, ambiguous input, tracking loss, and simultaneous gestures.
 
 ### Phase 5 — Cursor movement
 
-**Status: 🟡 1/5.** Only real output exists (`pyautogui.moveTo`); there is no dry-run adapter, no
-opt-in gate, no throttling, and no paused/untracked state to suppress on. This is the phase that has to
-convert the prototype's unconditional cursor control into an opt-in adapter.
+**Status: 🟡 3/5 (2026-10-10).** The adapter split landed with Phase 1 (`RealMouseOutput` /
+`RecordingMouseOutput`), cursor output is opt-in (the app starts paused; `--dry-run` emits nothing at all),
+and moves smaller than `min_move_pixels` are skipped rather than issued. What remains: a genuine rate
+limit/coalescer, and suppression on an explicit tracking-lost state, which Phase 4 defines.
 
 - Map filtered coordinates to the active screen.
 - Add dry-run and real cursor adapters.
@@ -289,9 +422,9 @@ tracking loss with the recording adapter. Then perform a cautious manual cursor 
 
 ### Phase 6 — Left and right clicks
 
-**Status: 🟡 3/5 + 1 partial.** Rising-edge detection, release-then-re-arm and the cooldown all work;
-what's missing is scroll precedence, pause suppression, and status feedback. Also switch the inline L1
-pinch test over to the already-tested `gesture.is_pinch()`.
+**Status: 🟡 3/5 + 1 partial.** Rising-edge detection, release-then-re-arm, the cooldown and pause
+suppression all work (§4 covers the held-pinch-across-resume case). What is missing is scroll precedence
+and status feedback; also switch the inline L1 pinch test over to the already-tested `gesture.is_pinch()`.
 
 - Convert gesture transitions into one-shot left/right click events.
 - Prevent repeated clicks during sustained pinches.
@@ -331,8 +464,10 @@ sequences with recorded scroll events.
 
 ### Phase 8 — Pause, runtime, and feedback
 
-**Status: ⛔ 0/5 — nothing exists.** No pause toggle anywhere in the code base, no coordinator, and
-cleanup only runs when the user presses `q` (an exception in the loop leaves the camera and window open).
+**Status: 🟡 3/5 + 1 partial (2026-10-10).** Phase 1 built the coordinator and the pause path: a
+configurable keyboard toggle, paused startup, PAUSED/ACTIVE feedback on the preview, and cleanup in a
+`finally` block that also runs when the loop raises. Remaining: tracking-lost status, the optional gesture
+pause, and explicit tests for toggle idempotence, recovery and window-close teardown.
 
 - Add a configurable keyboard toggle, with startup paused.
 - Optionally add a gesture pause only after the keyboard control is reliable.
@@ -384,6 +519,12 @@ tracking, sustained gestures, repeated launch/cleanup, and full regression check
 - Use a **keyboard hotkey as the primary pause mechanism**; gesture-pause is optional and comes later.
 - Treat **macOS Camera and Accessibility permissions** as documented runtime requirements, and
   diagnose them in-app rather than failing with a bare OpenCV warning.
+- **`pyautogui` may be imported by exactly one module: `output.py`.** Everywhere else goes through a
+  `MouseOutput`, which is what keeps dry runs, tests and the paused path honest.
+- **Only `runtime.py` may call an output adapter**, and only after checking `can_emit`.
+- **The cursor reference is the wrist/palm, never the fingertip.** Fingertips are the most
+  articulation-dependent points on the hand; anything a finger does must be able to affect *gestures*
+  (clicks, scroll) but never the pointer position. See §2 "Pointer reference" for the modes and gains.
 
 ---
 

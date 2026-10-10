@@ -12,7 +12,7 @@ gesture state machine, cursor, clicks, scroll, pause/runtime, calibration) are d
 [`AGENTS.md`](AGENTS.md) — see §2 "Phase status" for what is actually implemented today.
 
 ## Features
-- Cursor control via index-finger tracking
+- Cursor control from the wrist/palm (finger articulation cannot move the pointer)
 - Click debounce using pinch detection
 - Right-click gesture support
 - Scroll gestures based on finger movement
@@ -36,7 +36,84 @@ Or run the entry point directly from the project root:
 python3 kinematic/main.py
 ```
 
-The app opens the default webcam and uses the live hand landmarks to drive the mouse pointer. Press `q` in the video window to quit.
+**The app starts paused.** It opens the default webcam, shows the preview and analyses frames, but sends
+nothing to the mouse until you press `SPACE` (or `p`). After that it moves the pointer with your index
+finger, left-clicks on a thumb–index pinch and right-clicks on a thumb–middle pinch. `ESC` or `q` quits.
+The preview shows `PAUSED` / `ACTIVE` and the live loop rate in its top-left corner.
+
+```bash
+python3 -m kinematic.main --active      # start controlling the mouse immediately
+python3 -m kinematic.main --dry-run     # run the whole pipeline, emit no mouse events at all
+python3 -m kinematic.main --no-preview  # no window (quit with Ctrl-C)
+```
+
+Nothing is emitted while paused, and `--dry-run` swaps the real output adapter for a recording one, so
+that mode needs no Accessibility permission and is safe to run anywhere.
+
+## Pointing
+
+The cursor is driven by your **wrist/palm**, not your fingertip, and by default it moves *relative* to
+your hand — like a mouse rather than a laser pointer:
+
+- **Move your hand** → the cursor moves. Deliberate hand travel of about 20% of the frame's width crosses
+  the screen once.
+- **Curl or spread your fingers, pinch, or rotate your wrist** → the cursor does not move at all. Fingers
+  only ever produce gestures (pinch = click, index-finger sweep while the hand holds still = scroll).
+- **Move your hand back to a comfortable position** → the cursor moves back too, so there is no "lift and
+  reposition" clutch yet. If you would rather point at a spot and have the cursor stay there, use
+  position mapping:
+
+```bash
+python3 -m kinematic.main --pointer-mode absolute      # cursor maps to where your hand is in the frame
+python3 -m kinematic.main --pointer-reference wrist    # the wrist joint alone (even more stable than the palm)
+python3 -m kinematic.main --pointer-reference index    # the old fingertip behaviour (fingers drag the cursor)
+```
+
+Which hand point is used, how fast the pointer moves and how much hand jitter is ignored are all fields on
+`HandMouseConfig` (`pointer_reference`, `pointer_sensitivity`, `pointer_deadzone`,
+`relative_scale_by_hand`). `pointer_deadzone` is worth tuning for your own hands and camera:
+`python3 tools/measure_stability.py --seconds 15` reports the per-frame wrist/palm jitter in your setup
+next to the configured deadzone (it only reads landmarks — it cannot move your mouse).
+
+## Performance
+
+The control loop now runs at the camera's own frame rate. A ~30 fps webcam caps it: this FaceTime
+camera negotiates 30 fps whatever resolution is requested, and `read()` blocks for the frame interval
+either way, so 30 fps is the ceiling and no setting raises it.
+
+Measured on macOS, same machine, same stages, with a hand in frame:
+
+| | before | after |
+| --- | --- | --- |
+| processed frames per second | 5.8 fps | **28.8 fps** |
+| per-frame budget | 173 ms | **34 ms** |
+
+What made the difference:
+
+- **`pyautogui.PAUSE = 0`** — the library default of `0.1` is slept *before every public call*, so
+  each cursor move, click and scroll cost ~113 ms instead of ~11 ms. This was the single biggest cost.
+- **Threaded capture** (`kinematic/capture.py`) — the loop no longer waits for `read()` before it can
+  start working, and it never processes a frame that was queued while it was busy.
+- **`model_complexity = 0`** (MediaPipe lite) — ~1.5 ms/frame cheaper. MediaPipe's cost does not depend
+  on the frame size at all; it resizes to its own 256x256 internally.
+- **Preview at `preview_scale`** (0.5) instead of full frame, and an ~11 ms `moveTo` skipped when it
+  cannot shift the cursor by `min_move_pixels`.
+
+The preview draws the live loop rate in its top-left corner. To measure the loop rate without moving your
+mouse, run `python3 tools/measure_loop.py` (add `--synthetic-hand --active` to exercise the cursor path
+with no hand in frame — it intercepts every mouse call and reports the count). Everything above is a field
+on `HandMouseConfig`, so it can be tuned without touching the loop:
+
+| Field | Default | Effect |
+| --- | --- | --- |
+| `mouse_pause` | `0.0` | seconds pyautogui sleeps per mouse call (library default is 0.1) |
+| `min_move_pixels` | `0.5` | skip a cursor move smaller than this many pixels |
+| `model_complexity` | `0` | 0 = lite/faster, 1 = full/slower hand model |
+| `preview_scale` | `0.5` | preview size as a fraction of the frame (1.0 = full size) |
+| `show_preview` | `True` | `False` drops the ~14 ms display cost (then quit with Ctrl-C, not `q`) |
+| `show_fps` | `True` | draw the loop rate on the preview |
+| `smoothing` | `0.35` | EMA factor; raise it for a snappier pointer, lower it for less jitter |
+| `capture_width` / `capture_height` / `capture_fps` / `capture_buffer_size` | 1280 / 720 / 30 / 1 | what is requested from the camera |
 
 ## Requirements
 
