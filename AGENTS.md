@@ -434,7 +434,9 @@ files ... incompatible with cpython-39" failure that looks like a broken install
 properly initialize!` until the *host process* (Terminal / IDE / agent) is allowed in
 System Settings → Privacy & Security → Camera. The code then raises
 `RuntimeError: Could not open camera index 0.` — a permission problem, not a code bug. Verify capture
-separately from gesture logic.
+separately from gesture logic. **Current status on this machine (2026-10-10): granted** —
+`cv2.VideoCapture(0)` opens and returns 1920x1080 frames, so the app genuinely runs now. See 8.9 for what
+that implies about smoke tests.
 
 **8.5 Accessibility permission for PyAutoGUI.**
 PyAutoGUI's mouse calls are silently ignored on macOS until the host process is granted Accessibility.
@@ -473,3 +475,18 @@ Consequences: Copilot may write into this directory again (it already did once, 
 files here are not protected by git. Before starting a phase, state which copy you are working in. The
 branch commits are the only tracked record of the prototype, so if you consolidate the two, do it
 deliberately rather than by overwriting either side.
+
+**8.9 Never smoke-test this app by launching it.**
+With the camera permission granted (8.4), `python3 kinematic/main.py` and `python3 -m kinematic.main`
+open the webcam, pop a window and immediately start moving the user's **real** cursor — a "does it still
+start?" check is enough to hijack their mouse. Use one of these instead:
+
+```bash
+python3 -c "import runpy; runpy.run_path('kinematic/main.py', run_name='probe')"   # imports all, never calls main()
+python3 -m unittest discover -s tests
+```
+
+Observed 2026-10-10: a clone-verification run of `python3 -m kinematic.main` really did run the live loop
+on the user's machine and then exited 0 with no `q` keypress and no traceback — the exit path is not
+explained by the code (the only `break` is on `ord("q")`). Treat that as an open question, and as another
+argument for Phase 1's explicit pause/quit and Phase 8's exception-safe teardown.
