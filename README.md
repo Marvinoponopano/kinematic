@@ -39,7 +39,8 @@ python3 kinematic/main.py
 **The app starts paused.** It opens the default webcam, shows the preview and analyses frames, but sends
 nothing to the mouse until you press `SPACE` (or `p`). After that it moves the pointer with your index
 finger, left-clicks on a thumb–index pinch and right-clicks on a thumb–middle pinch. `ESC` or `q` quits.
-The preview shows `PAUSED` / `ACTIVE` and the live loop rate in its top-left corner.
+The preview shows `PAUSED` / `ACTIVE`, the live loop rate and the detected hand skeleton in its top-left
+corner.
 
 ```bash
 python3 -m kinematic.main --active      # start controlling the mouse immediately
@@ -49,6 +50,19 @@ python3 -m kinematic.main --no-preview  # no window (quit with Ctrl-C)
 
 Nothing is emitted while paused, and `--dry-run` swaps the real output adapter for a recording one, so
 that mode needs no Accessibility permission and is safe to run anywhere.
+
+## Smoothing and reach
+
+Two knobs decide how the pointer *feels*:
+
+- **Smoothing** (`smoothing_mode`, default `one_euro`): the 1-euro filter adapts its cutoff to hand speed —
+  heavy smoothing when your hand is still, almost none when it moves. It replaced a fixed-factor EMA after
+  a seeded comparison (`tools/compare_smoothing.py`, 16 seeds) showed it with 25% less jitter, a 2-frame
+  instead of 6-frame step response, and 151 px instead of 529 px of lag during fast movement.
+  `--smoothing-mode ema` restores the old filter if you prefer its feel.
+- **Reach** (`frame_margin`, default 0.15, absolute mode only): the inner 70% of the camera frame maps onto
+  the whole screen, so the screen corners are reachable without moving your hand to the edge of the frame.
+  `screen_margin` keeps a margin free at the screen edges instead.
 
 ## Pointing
 
@@ -67,6 +81,7 @@ your hand — like a mouse rather than a laser pointer:
 python3 -m kinematic.main --pointer-mode absolute      # cursor maps to where your hand is in the frame
 python3 -m kinematic.main --pointer-reference wrist    # the wrist joint alone (even more stable than the palm)
 python3 -m kinematic.main --pointer-reference index    # the old fingertip behaviour (fingers drag the cursor)
+python3 -m kinematic.main --smoothing-mode ema         # the fixed-factor filter instead of the 1-euro filter
 ```
 
 Which hand point is used, how fast the pointer moves and how much hand jitter is ignored are all fields on

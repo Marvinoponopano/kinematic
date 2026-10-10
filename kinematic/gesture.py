@@ -1,5 +1,5 @@
 import math
-from typing import Any, Optional, Sequence, Tuple
+from typing import Any, Iterator, NamedTuple, Optional, Sequence, Tuple
 
 Point = Tuple[float, float]
 
@@ -131,3 +131,69 @@ def pointer_delta(previous: Point, current: Point, reference_scale: Optional[flo
         dx /= reference_scale
         dy /= reference_scale
     return (dx, dy)
+
+
+# --- Phase 3 geometry ---------------------------------------------------------------
+
+
+class PinchDistances(NamedTuple):
+    """The three pinch distances that matter for gestures, in normalized frame units."""
+
+    thumb_index: float
+    thumb_middle: float
+    index_middle: float
+
+
+def midpoint(a: Point, b: Point) -> Point:
+    """The point halfway between *a* and *b*."""
+    return ((a[0] + b[0]) / 2.0, (a[1] + b[1]) / 2.0)
+
+
+def midpoints(points: Sequence[Point]) -> Point:
+    """Centroid of a sequence of points (used for the palm and multi-point references)."""
+    if not points:
+        raise ValueError("midpoints() needs at least one point")
+    return (
+        sum(point[0] for point in points) / len(points),
+        sum(point[1] for point in points) / len(points),
+    )
+
+
+def pinch_distances(landmarks: Sequence[Any]) -> PinchDistances:
+    """Thumb-index, thumb-middle and index-middle distances for one hand."""
+    thumb = landmark_point(landmarks, THUMB_TIP)
+    index = landmark_point(landmarks, INDEX_TIP)
+    middle = landmark_point(landmarks, MIDDLE_TIP)
+    return PinchDistances(
+        thumb_index=point_distance(thumb, index),
+        thumb_middle=point_distance(thumb, middle),
+        index_middle=point_distance(index, middle),
+    )
+
+
+def hand_span(landmarks: Sequence[Any]) -> float:
+    """Index-knuckle to pinky-knuckle distance: a second, independent hand-size proxy.
+
+    Unlike :func:`hand_scale` (which runs from the wrist to the middle knuckle) this one
+    contains no wrist, so the two disagree when the wrist landmark is noisy — a useful
+    cross-check for Phase 4's relative thresholds.
+    """
+    return max(
+        point_distance(landmark_point(landmarks, INDEX_MCP), landmark_point(landmarks, PINKY_MCP)),
+        MIN_HAND_SCALE,
+    )
+
+
+def clamp_point(point: Point, width: float, height: float) -> Point:
+    """Clamp a pixel-space point into a 0..width by 0..height box."""
+    return (clamp(point[0], 0.0, width), clamp(point[1], 0.0, height))
+
+
+def mirror_point(point: Point) -> Point:
+    """Mirror a normalized point horizontally (``x`` becomes ``1 - x``).
+
+    The pipeline flips the frame before detection, so landmarks are already mirrored;
+    this exists for the raw (pre-flip) coordinates and to make the orientation explicit
+    and testable.
+    """
+    return (1.0 - point[0], point[1])

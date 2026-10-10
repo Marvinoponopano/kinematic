@@ -272,7 +272,8 @@ class AppFacadeTests(unittest.TestCase):
         app.resume()
         self.assertFalse(app.paused)
 
-        app._update_cursor((0.5, 0.5))
+        # A point away from the screen centre, so the mapping has something to move to.
+        app._update_cursor((0.8, 0.8))
         app._handle_clicks((0.5, 0.4), (0.8, 0.8))
         app._handle_scroll((0.5, 0.5))
         self.assertGreaterEqual(app.emitted, 1)

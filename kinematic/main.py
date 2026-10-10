@@ -103,6 +103,12 @@ def parse_args(argv: Optional[list] = None) -> argparse.Namespace:
         default=None,
         help="hand point the cursor follows: palm (default, wrist + knuckles), wrist (most stable), index (legacy fingertip)",
     )
+    parser.add_argument(
+        "--smoothing-mode",
+        choices=("ema", "one_euro"),
+        default=None,
+        help="cursor filter: one_euro (default, less lag at the same jitter) or ema (the previous fixed-factor filter)",
+    )
     return parser.parse_args(argv)
 
 
@@ -120,6 +126,8 @@ def build_config(args: argparse.Namespace) -> HandMouseConfig:
         overrides["pointer_mode"] = args.pointer_mode
     if args.pointer_reference is not None:
         overrides["pointer_reference"] = args.pointer_reference
+    if args.smoothing_mode is not None:
+        overrides["smoothing_mode"] = args.smoothing_mode
     return HandMouseConfig(**overrides)
 
 
@@ -133,7 +141,8 @@ def main(argv: Optional[list] = None) -> int:
         f"kinematic: pointer mode={runtime.config.pointer_mode} "
         f"reference={runtime.config.pointer_reference} "
         f"sensitivity={runtime.config.pointer_sensitivity} "
-        f"deadzone={runtime.config.pointer_deadzone}"
+        f"deadzone={runtime.config.pointer_deadzone} "
+        f"smoothing={runtime.config.smoothing_mode}"
     )
     if runtime.paused:
         print("kinematic: paused at startup - press SPACE in the preview window to control the mouse, ESC or q to quit")

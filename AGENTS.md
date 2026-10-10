@@ -1,7 +1,7 @@
 # AGENTS.md — Kinematic (webcam hand mouse)
 
 Context file for AI coding agents working in this repo. Read this before touching code.
-Last updated: 2026-10-10 (Phase 1 of the roadmap complete — see §2 "Phase status" and §5 Phase 1).
+Last updated: 2026-10-10 (Phases 1–3 of the roadmap complete — see §2 "Phase status" and §5).
 
 > If your tool looks for a different filename (`CLAUDE.md`, `.cursorrules`, `.windsurfrules`,
 > `.github/copilot-instructions.md`), copy or symlink this file to that name — the content is
@@ -35,19 +35,26 @@ kinematic/
 ├── kinematic/
 │   ├── __init__.py        # re-exports HandMouseConfig, is_pinch, is_right_click_gesture, smooth_point
 │   ├── capture.py         # ThreadedCamera: background-thread grabber handing out the newest frame
-│   ├── config.py          # HandMouseConfig dataclass (9 behavioural + 13 performance + 4 safety fields)
-│   ├── gesture.py         # pure helpers: point_distance, smooth_point, clamp, landmark_points,
-│   │                      #   is_pinch, is_right_click_gesture, relative_move_delta,
-│   │                      #   normalize_screen_point, needs_cursor_update
+│   ├── config.py          # HandMouseConfig dataclass (behavioural + performance + safety + pointer + smoothing fields)
+│   ├── gesture.py         # pure helpers: distances, midpoints, pinch distances, hand scale/span,
+│   │                      #   pinch/right-click detection, clamping, mirroring, EMA, pointer helpers
+│   ├── landmarks.py       # Landmark / HandLandmarks + the one MediaPipe conversion point
+│   ├── mapping.py         # Region + map_point_to_screen (frame region -> screen region)
 │   ├── output.py          # MouseOutput adapters: RealMouseOutput / RecordingMouseOutput (mock)
+│   ├── preview.py         # landmark skeleton drawing for the debug preview (drawn with cv2, no protobuf)
 │   ├── runtime.py         # HandMouseRuntime: pipeline coordinator + the pause gate on all output
+│   ├── smoothing.py       # cursor filters: ExponentialMovingAverage, OneEuroFilter (both resettable)
 │   └── main.py            # CLI + HandMouseApp facade over the runtime
 └── tests/
-    ├── test_gesture_logic.py    # 4 cases: pure gesture helpers
-    ├── test_capture_pipeline.py # 9 cases: perf defaults, cursor-move guard, camera error path
-    ├── test_phase1_safety.py    # 19 cases: no output while paused, adapters, keys, no-camera paths
+    ├── test_gesture_logic.py     # 4 cases: pure gesture helpers
+    ├── test_capture_pipeline.py  # 9 cases: perf defaults, cursor-move guard, camera error path
+    ├── test_phase1_safety.py     # 19 cases: no output while paused, adapters, keys, no-camera paths
+    ├── test_phase2_landmarks.py  # 15 cases: protobuf conversion, hand protocol, skeleton drawing
+    ├── test_phase3_geometry.py   # 23 cases: distances, midpoints, clamping, region mapping
+    ├── test_phase3_smoothing.py  # 21 cases: EMA + 1-euro behaviour, jitter, latency, reset
     └── test_pointer_reference.py # 21 cases: wrist/palm reference, curl must not move the cursor, scroll guard
 tools/
+├── compare_smoothing.py         # seeded jitter-vs-lag comparison of the cursor filters
 ├── measure_loop.py              # measure the loop rate with the mouse intercepted (nothing moves)
 └── measure_stability.py         # per-frame wrist/palm jitter vs pointer_deadzone (no output adapter at all)
 ```
@@ -65,7 +72,9 @@ python3 -m kinematic.main --active          # start controlling the mouse straig
 python3 -m kinematic.main --dry-run --no-preview   # whole pipeline, zero output, headless-safe
 python3 -m kinematic.main --pointer-reference wrist    # use the wrist joint instead of the palm
 python3 -m kinematic.main --pointer-mode absolute      # old position-mapped pointing
-python3 -m unittest discover -s tests       # 53 tests, all pass
+python3 -m kinematic.main --smoothing-mode ema         # the pre-Phase-3 fixed-factor filter
+python3 -m unittest discover -s tests       # 112 tests, all pass
+python3 tools/compare_smoothing.py          # seeded jitter vs lag table for the cursor filters
 python3 tools/measure_loop.py --synthetic-hand --active --fingers-only   # the finger-curl regression demo
 python3 tools/measure_stability.py --seconds 15          # tune pointer_deadzone against your own hand
 ```
@@ -103,19 +112,72 @@ Also present but not used by this project: Homebrew `python3.13` / `python3.14`,
   pinched, which is stricter than a "right pinch".
 - **Thresholds are absolute landmark distances**, not relative to hand scale — they drift with
   distance from the camera. Phase 4 replaces them with hand-scale-relative thresholds.
-- **The absolute mapping is not calibrated** (only used with `pointer_mode="absolute"`):
-  `runtime.update_cursor()` multiplies the normalized point by `pointer_scale = 1.8` and clamps to the
-  screen, so the reachable region is skewed off-centre. The default relative mode does not use it.
-- **Tracking loss resets the pointer anchor but not the smoothing state.** A reacquired hand re-anchors
-  instead of jumping (fixed 2026-10-10), and `last_index`/`last_pinch`/`last_right_click` reset, but the
-  smoothed cursor position still carries over, so the first frames after reacquire can glide.
+- ~~The absolute mapping was not calibrated~~ — **fixed in Phase 3.** `pointer_scale × clamp` (which
+  skewed the reachable area off-centre) is replaced by `mapping.map_point_to_screen()`: the inner 70% of
+  the frame maps onto the whole screen, with configurable frame and screen margins.
+- ~~Tracking loss left the smoothing state behind~~ — **fixed in Phase 3.** The pointer anchor re-anchors,
+  the gesture flags reset, and now `cursor_filter.reset()` clears the filter too, so a reacquired hand
+  neither jumps nor glides.
 - **The loop is covered only through fakes.** `runtime.run()` is tested with a fake camera and fake
   landmarks; MediaPipe's own output, the real camera path and the click/scroll branches are not
   asserted in the suite (they are exercised manually).
 - **No packaging** (no `pyproject.toml`) and no logging.
-- **Two helpers are dead or duplicated:** `gesture.clamp()` is defined but never called — `runtime.update_cursor()`
-  clamps with bare `min(max(...))` instead — and `gesture.is_pinch()` is exported and tested but unused by
-  the pipeline, which still computes pinch inline with an L1 metric.
+- **One duplicated helper:** `gesture.is_pinch()` is exported and tested but unused by the pipeline,
+  which still computes pinch inline with an L1 metric (Phase 6 owns the switch). `gesture.clamp()` is now
+  used — by `clamp_point()` and the pointer target clamp.
+
+### Landmarks and preview (Phase 2, finished 2026-10-10)
+
+MediaPipe's protobuf no longer reaches the pipeline. `capture`/`runtime` convert it exactly once,
+at the boundary, in `landmarks.hands_from_results()`:
+
+- `Landmark` (frozen dataclass: x/y/z, normalized) and `HandLandmarks` (21 landmarks + handedness +
+  score). `HandLandmarks` supports `len()`, iteration and indexing, so every pure helper in
+  `gesture.py` accepts it unchanged — and accepts a test's `SimpleNamespace` list too.
+- The conversion **copies** (a test mutates the "proto" afterwards to prove it), and an incomplete
+  detection is flagged `is_complete=False`, which the runtime ignores rather than letting a 3-landmark
+  hand raise `IndexError` deep in the geometry.
+- `preview.draw_hands()` draws the 21-point skeleton with plain `cv2` line/circle calls — no
+  `drawing_utils`, no protobuf — so the overlay is testable by asserting pixels on a black frame, and
+  an incomplete hand draws nothing. `show_landmarks` (default on) switches it off.
+
+Nothing else in the package imports protobuf-shaped objects or MediaPipe drawing utils now.
+
+### Smoothing and screen mapping (Phase 3, finished 2026-10-10)
+
+Two new pure modules, both importable without a camera:
+
+- `smoothing.py`: `ExponentialMovingAverage` (the previous inline EMA, kept bit-for-bit) and
+  `OneEuroFilter` (Casiez et al.): the cutoff opens with hand speed, so a still hand is smoothed hard
+  and a moving hand is followed closely. Both are timestamp-driven and resettable; `filter_from_config`
+  is the only place `smoothing_mode` is interpreted.
+- `mapping.py`: `Region` + `map_point_to_screen()`. Absolute mode now maps the **inner 70% of the frame**
+  (`frame_margin=0.15`) onto the whole screen, so the screen corners are reachable without moving your
+  hand to the frame edge, where landmarks get unreliable. `pointer_scale` fell from 1.8 to 1.0 because
+  the region mapping replaced its job — the old `pointer_scale × clamp` skewed the reachable area
+  off-centre, which was the documented calibration gap.
+
+**The default filter was chosen from measurements**, not taste. `tools/compare_smoothing.py` (16 seeds,
+300 frames each, jitter amplitude ±0.01, 30 fps, results in normalized landmark units, lag converted to
+pixels at 1710 px and `pointer_sensitivity` 5.0):
+
+| Filter | Jitter (stdev) | 90% step | Lag @0.25/s | Lag @1.0/s |
+| --- | --- | --- | --- | --- |
+| `ema` 0.35 (previous default) | 0.00268 | 6 frames | 132 px | **529 px** |
+| `ema` 0.50 | 0.00336 | 4 frames | 71 px | 285 px |
+| `one_euro` min 1.0, beta 0.0 | 0.00179 | 13 frames | 340 px | 1360 px |
+| `one_euro` min 1.0, beta 2.0 | 0.00185 | 2 frames | 227 px | 454 px |
+| **`one_euro` min 1.0, beta 8.0 (new default)** | **0.00201** | **2 frames** | **113 px** | **151 px** |
+| `one_euro` min 2.0, beta 6.0 | 0.00254 | 2 frames | 97 px | 170 px |
+
+Only `min=1.0 beta=8.0` and `min=2.0 beta=6.0` are Pareto-better than the old EMA (less jitter *and*
+no more lag at either speed); beta=8 wins on jitter and on the fast-motion case that matters most in
+relative mode (151 px vs 529 px of trailing). Hence `smoothing_mode="one_euro"`, `one_euro_beta=8.0`.
+`--smoothing-mode ema` restores the previous feel for anyone who preferred it.
+
+Tracking loss now resets the filter (`cursor_filter.reset()`), which is the phase's last requirement:
+after a lost-and-reacquired hand the next sample passes straight through, so the cursor neither glides
+from stale state nor keeps drifting on a hand that is no longer moving.
 
 ### Pointer reference (fixed 2026-10-10)
 
@@ -190,11 +252,11 @@ putting a hand in front of the camera).
 
 ### Phase status — which phases are actually implemented (audited 2026-10-10)
 
-**Phase 1 is complete (5/5). Phases 2–9 are not.** Before Phase 1 this repo was a prototype that drove
-the real mouse from startup with none of the safety layer in place; that is fixed — see §5 Phase 1 for
-what landed and the behaviour change it introduced. The later phases' subject matter (capture,
-smoothing, clicks, scroll) is present in the prototype's shape, not in the shape those phases specify,
-so read each phase's own `Status:` line below before starting work.
+**Phase 1 is complete (5/5). Phases 2 and 3 are complete too (5/5 each).** Before Phase 1 this repo
+was a prototype that drove the real mouse from startup with none of the safety layer in place; that is
+fixed — see §5 for what each phase landed. Phases 4–9 are not implemented in the shape the plan asks
+for, though the prototype's subject matter (clicks, scroll) exists in some form; read each phase's own
+`Status:` line below before starting work.
 
 *How this was audited:* every non-`.git` file was listed and read; the source was grep'd for each
 phase's marker concepts (`pause`, `mock`, `record`, `adapter`, `dry`, `Enum`, `state`, `hyster`,
@@ -205,28 +267,33 @@ updated since.
 
 | Phase | Status | Exists | Missing |
 | --- | --- | --- | --- |
-| 1 — Foundation & safety | ✅ **5/5 (2026-10-10)** | Modules split: `capture.py`, `gesture.py`, `output.py` (adapters), `runtime.py` (coordinator), `main.py` (CLI); `requirements.txt`; 53-test suite; **paused startup** with SPACE toggle and ESC/q quit; **`RecordingMouseOutput` mock adapter** used by tests and `--dry-run`; macOS permission docs in README | — |
-| 2 — Capture pipeline | 🟡 **4/5** | `capture.py`'s threaded `ThreadedCamera` (`isOpened()` error, buffer size, device-error reporting), `cv2.flip` mirroring, BGR→RGB, `mp.solutions.hands`, invalid-frame error, exception-safe teardown (the runtime's `try/finally`), loop-rate overlay on the preview | Internal landmark representation (raw MediaPipe objects still flow through) and landmark drawing on the preview |
-| 3 — Geometry/mapping/smoothing | 🟡 **3/5 + 1 partial** | `point_distance`, `smooth_point` (fixed-factor EMA), `clamp` (now used by the pointer clamp), `landmark_points`, `is_pinch`, `normalize_screen_point`, `relative_move_delta`, **`hand_scale`** (wrist→middle knuckle), `wrist_point`/`palm_center`, `pointer_delta`, `needs_cursor_update` | Midpoints, a **configurable screen control region** (relative mode needs none; absolute mode still uses `pointer_scale` + clamp), One Euro smoothing, filter reset on tracking loss |
+| 1 — Foundation & safety | ✅ **5/5 (2026-10-10)** | Modules split: `capture.py`, `gesture.py`, `output.py` (adapters), `runtime.py` (coordinator), `main.py` (CLI); `requirements.txt`; 112-test suite; **paused startup** with SPACE toggle and ESC/q quit; **`RecordingMouseOutput` mock adapter** used by tests and `--dry-run`; macOS permission docs in README | — |
+| 2 — Capture pipeline | ✅ **5/5 (2026-10-10)** | `capture.py`'s threaded `ThreadedCamera` (`isOpened()` error, buffer size, device-error reporting); `cv2.flip` mirroring, BGR→RGB, `mp.solutions.hands`, invalid-frame error, exception-safe teardown (the runtime's `try/finally`); **`landmarks.py`** (Landmark/HandLandmarks, the single protobuf conversion point, incomplete detections flagged); **preview overlay** of the loop rate *and* the 21-point skeleton (`preview.py`, drawn with cv2, `show_landmarks`) | — |
+| 3 — Geometry/mapping/smoothing | ✅ **5/5 (2026-10-10)** | `gesture.py`: distances, `midpoint`/`midpoints`, `pinch_distances`, `hand_scale` + `hand_span`, `clamp`/`clamp_point`, `mirror_point`, EMA; `mapping.py`: `Region` + `map_point_to_screen` (frame region → screen region, clamping, mirroring); `smoothing.py`: EMA + 1-euro filters with `reset()`, wired into the runtime with a tracking-loss reset; 44 deterministic tests for distances, clamping, smoothing, latency and reset | Midpoints are available but not yet *used* by a gesture; One Euro parameters are tuned for this camera rather than for everyone |
 | 4 — Gesture state machine | ⛔ **0/5** | Only a rising-edge boolean + `debounce_seconds` in `runtime.py` | States/`Enum` (0 hits), hysteresis, hold times, hand-scale-relative thresholds, pure recognizer with injected timestamp, scroll precedence |
 | 5 — Cursor movement | 🟡 **3/5 + 1 partial** | Palm/wrist-relative pointer pipeline (see §2 "Pointer reference") with smoothing, clamp and `min_move_pixels`; **dry-run and real adapters** (`output.py`); **opt-in gate** (starts paused, `--dry-run`); paused/bounds suppression; re-anchor on reacquire | A real rate limit/coalescer, an explicit *tracking-lost* state (Phase 4 defines it), and the absolute mapping's calibration |
 | 6 — Left & right clicks | 🟡 **3/5 + 1 partial** | Left click on pinch rising edge, right click via `is_right_click_gesture` rising edge, shared cooldown; release-then-re-arm works; **suppressed while paused** (Phase 1's `can_emit` gate, including a pinch held across a resume) | Scroll precedence and last-action status; the pinch test is re-implemented inline with an L1 metric instead of `gesture.is_pinch()` |
 | 7 — Two-finger scroll | ⛔ **0/5 + 1 partial** | `pyautogui.scroll()` driven by index-finger delta | Two-finger (index/middle) reference point, horizontal scroll, dead zone, sensitivity config (gain hardcoded `-900`), direction inversion, rate limiting, **click suppression while scrolling** (a pinch while moving both clicks and scrolls) |
 | 8 — Pause/runtime/feedback | 🟡 **3/5 + 1 partial** | `runtime.py` coordinator; configurable keyboard toggle (`toggle_pause_keys`) with paused startup; PAUSED/ACTIVE status on the preview; exception-safe teardown (`try/finally`) | A *tracking-lost* status, the optional gesture pause, and tests for toggle idempotence, recovery and window-close cleanup |
 | 9 — Calibration/hardening | ⛔ **0/5 + 1 partial** | `HandMouseConfig` with 9 tunables | Mirroring/margins/sensitivity/hotkey knobs, diagnostics, logging (0 hits), profiling, packaging (`pyproject.toml`), final setup docs |
-| Tests | 53 passing | gesture helpers; config defaults; cursor-move guard; camera error path; the Phase 1 safety suite; the pointer-reference suite (curl must not move the cursor, gain/clamp/deadzone maths, re-anchor, scroll guard) | MediaPipe's own detections, the real camera path, and the click/scroll branches beyond those cases |
+| Tests | 112 passing | gesture helpers; config defaults; cursor-move guard; camera error path; the Phase 1 safety suite; the pointer-reference suite (curl must not move the cursor, gain/clamp/deadzone maths, re-anchor, scroll guard); the landmark suite (protobuf conversion, incomplete hands, skeleton pixels); the Phase 3 geometry suite (distances, midpoints, clamping, region mapping); the Phase 3 smoothing suite (EMA + 1-euro behaviour, jitter, latency, tracking-loss reset) | MediaPipe's own detections, the real camera path, and the click/scroll branches beyond those cases |
 
 **What this means for the next session:**
 
-- **Phase 1 is done.** The safety layer exists, so every later phase can be built and tested without
-  risking the user's desktop. Start from §5 Phase 2.
-- **Retrofit, don't rewrite.** The prototype's capture, smoothing, click and scroll behaviour now lives
-  behind `runtime.py`. Later phases should add their own module and switch the runtime over to it, leaving
-  the previous path reachable until the switch is verified — the same additive discipline, just with a
-  deliberate hand-off.
-- **Phases 4, 7 and 8 are the real work.** A gesture state machine, two-finger scrolling and the
-  status/teardown layer do not exist in any form. Phase 7 in particular has to *replace* the current
-  pointer-driven scroll, so treat it as the riskiest change to the existing feel.
+- **Phases 1–3 are done.** Capture, geometry, mapping, smoothing and the safety layer are all in place and
+  tested, so every remaining phase can be built on a pipeline that cannot hurt the desktop and does not
+  need a camera in the test suite.
+- **Phase 4 is the next real step**, and it is the one that pays off in behaviour: an explicit
+  state machine (neutral / left pinch / right pinch / two-finger scroll / paused / tracking-lost) with
+  hysteresis, hold times and hand-scale-relative thresholds. `hand_scale`, `hand_span`, `pinch_distances`
+  and `midpoints` were added in Phase 3 precisely so Phase 4 can use relative thresholds instead of the
+  absolute ones it has now; the gesture logic is still two booleans and a debounce in `runtime.py`.
+- **Retrofit, don't rewrite.** Each phase so far added a module and switched the runtime over while leaving
+  the previous path reachable (EMA next to One Euro, index reference next to palm, absolute next to
+  relative). Keep doing that: it is what makes the changes reviewable and revertible.
+- **Phases 6–8 still own the rough edges** listed in §2's known gaps: the click path uses an inline L1
+  pinch test instead of `gesture.is_pinch()`, scrolling is still index-finger-driven (now correctly gated
+  on a still hand), and there is no status/teardown work beyond what Phase 1 built.
 
 ---
 
@@ -335,10 +402,17 @@ runtime; the old code path is still reachable, just not the default.
 
 ### Phase 2 — Webcam and MediaPipe pipeline
 
-**Status: 🟡 4/5 (2026-10-10).** Capture now lives in `capture.py` as a threaded grabber with device-error
-reporting and a buffer size of 1, the runtime owns teardown (`try/finally`) and the preview overlays the
-loop rate. Missing: an internal landmark representation (raw MediaPipe objects flow straight through) and
-drawing the landmarks on the preview.
+**Status: ✅ 5/5 complete (2026-10-10).** All five deliverables landed. Capture is a threaded grabber in
+`capture.py` with device-error reporting and a buffer size of 1; the runtime owns teardown (`try/finally`);
+mirroring, RGB conversion, missing-camera and invalid-frame handling are all in place; the preview overlays
+the loop rate *and* the 21-point landmark skeleton; and the internal representation (`landmarks.py`) means
+no protobuf-shaped object reaches the pipeline.
+
+Evidence: 15 new tests cover the conversion (including that it copies rather than aliases, and that an
+incomplete hand is ignored instead of raising), the `HandLandmarks` protocol, and the skeleton pixels on a
+black frame. Live: `python3 tools/measure_loop.py --synthetic-hand --active --preview` runs the overlay in
+the real loop at ~26.8 fps versus 29.8 fps without the preview window — the window costs ~3 fps, the
+drawing itself is in the noise.
 
 - Implement OpenCV camera capture and cleanup.
 - Add MediaPipe hand detection and landmark extraction.
@@ -356,11 +430,21 @@ work without mouse events.
 
 ### Phase 3 — Geometry, mapping, and smoothing
 
-**Status: 🟡 3/5 + 1 partial (2026-10-10).** `gesture.py` holds the pure geometry, including
-`hand_scale` (wrist→middle knuckle) and the wrist/palm reference points, plus a working fixed-factor EMA
-(bullet 4). `relative_move_delta` and the pointer path are in place; the cursors' clamp now uses
-`clamp()`. Missing: midpoints, a configurable screen control region (only the legacy `absolute` mode
-needs one) and the filter reset on tracking loss. Extend `gesture.py`; don't rewrite it.
+**Status: ✅ 5/5 complete (2026-10-10).** All five deliverables landed, and the phase's own requirement —
+"write deterministic tests for distances, clamping, smoothing, tracking-loss reset, and latency-sensitive
+behaviour; do not connect them to real mouse output" — is met: 44 new tests, none of which can reach the
+mouse (the recording adapter and the `can_emit` gate are unchanged).
+
+- Bullet 1 (distances, pinch distances, midpoints, hand scale): `point_distance`, `pinch_distances`,
+  `midpoint`, `midpoints`, `hand_scale`, `hand_span`.
+- Bullet 2 (normalize index-finger coordinates): `normalize_screen_point`, `mirror_point`, and
+  `HandLandmarks.point()` for landmark-space coordinates.
+- Bullet 3 (map to a configurable screen control region): `mapping.Region` +
+  `map_point_to_screen(frame_region, screen_region)`, wired into absolute mode with `frame_margin=0.15`.
+- Bullet 4 (EMA or One Euro): both, in `smoothing.py`, with the default chosen from the measured table in
+  §2 (One Euro, min_cutoff 1.0, beta 8.0 beat the previous EMA on jitter, step response and lag).
+- Bullet 5 (reset filters on tracking loss): `cursor_filter.reset()` in the runtime's no-hand branch, with
+  two tests (no glide after reacquire; a still hand does not keep drifting).
 
 - Add landmark distances, pinch distances, midpoints, and hand-scale calculations.
 - Normalize index-finger coordinates.
@@ -525,6 +609,12 @@ tracking, sustained gestures, repeated launch/cleanup, and full regression check
 - **The cursor reference is the wrist/palm, never the fingertip.** Fingertips are the most
   articulation-dependent points on the hand; anything a finger does must be able to affect *gestures*
   (clicks, scroll) but never the pointer position. See §2 "Pointer reference" for the modes and gains.
+- **MediaPipe's protobuf is converted once, at the boundary** (`landmarks.hands_from_results()`). Nothing
+  outside `capture.py`/`runtime.py` may see a MediaPipe object, and pure modules must keep accepting any
+  landmark sequence (a `HandLandmarks` or a test's `SimpleNamespace` list).
+- **Filters are pure and timestamp-driven**: they take the timestamp as an argument, own no clock, hold
+  resettable state, and never touch the mouse. A filter that cannot be reset is a filter that will glide
+  after a tracking loss.
 
 ---
 

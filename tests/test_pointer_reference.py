@@ -185,7 +185,9 @@ class CurlDoesNotMoveTheCursorTests(unittest.TestCase):
 class HandTranslationMovesTheCursorTests(unittest.TestCase):
     def test_translation_shift_is_applied_with_the_configured_gain(self):
         output = RecordingMouseOutput(screen=(1920, 1080))
-        runtime = make_runtime(output)  # sensitivity 5.0, smoothing 1.0
+        # EMA with factor 1.0 is the identity filter: this test is about the gain
+        # arithmetic, so the smoothing stage is deliberately neutralised.
+        runtime = make_runtime(output, smoothing_mode="ema", smoothing=1.0)
         start = output.position()
 
         runtime.process_landmarks(build_hand(offset=(0.0, 0.0)))  # anchor

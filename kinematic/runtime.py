@@ -23,20 +23,21 @@ from .landmarks import HandLandmarks, hands_from_results
 from .preview import draw_hands
 from .gesture import (
     clamp,
+    clamp_point,
     hand_scale,
     is_right_click_gesture,
     landmark_point,
     needs_cursor_update,
-    normalize_screen_point,
     point_distance,
     pointer_delta,
     pointer_reference_point,
     relative_move_delta,
-    smooth_point,
     INDEX_TIP,
     THUMB_TIP,
 )
+from .mapping import Region, map_point_to_screen
 from .output import MouseOutput, RealMouseOutput, RecordingMouseOutput
+from .smoothing import CursorFilter, filter_from_config
 
 
 class HandMouseRuntime:
@@ -56,6 +57,13 @@ class HandMouseRuntime:
 
         self.screen_w, self.screen_h = self.output.screen_size()
         self.cursor_x, self.cursor_y = self.output.position()
+        self.frame_region = Region.symmetric(self.config.frame_margin)
+        self.screen_region = Region.symmetric(self.config.screen_margin)
+        self.cursor_filter: CursorFilter = filter_from_config(self.config)
+        # Seed the filter with where the cursor already is, so the first update smooths
+        # from there instead of snapping — this is what the code did before the filter
+        # existed (cursor_x/y started at output.position() and the EMA blended from it).
+        self.cursor_filter.update((self.cursor_x, self.cursor_y))
         self.last_index: Optional[Tuple[float, float]] = None
         self.last_pointer_ref: Optional[Tuple[float, float]] = None
         self.last_pinch = False
@@ -118,24 +126,10 @@ class HandMouseRuntime:
 
     # -- per-frame pipeline ---------------------------------------------------
 
-    def update_cursor(self, index_tip: Tuple[float, float], now: Optional[float] = None) -> bool:
-        if not self.can_emit:
-            # Leave the cursor state untouched: on resume it still matches where the
-            # OS pointer actually is, so the pointer does not jump.
-            return False
-
-        target = normalize_screen_point(index_tip, self.screen_w, self.screen_h)
-        target = (
-            target[0] * self.config.pointer_scale,
-            target[1] * self.config.pointer_scale,
-        )
-        target = (
-            min(max(target[0], 0), self.screen_w),
-            min(max(target[1], 0), self.screen_h),
-        )
-
+    def _move_towards(self, target: Tuple[float, float], now: Optional[float] = None) -> bool:
+        """Smooth towards *target* and issue the move if it is worth one."""
         previous = (self.cursor_x, self.cursor_y)
-        smoothed = smooth_point(previous, target, self.config.smoothing)
+        smoothed = self.cursor_filter.update(target, now)
         self.cursor_x, self.cursor_y = smoothed
 
         if not needs_cursor_update(previous, smoothed, self.config.min_move_pixels):
@@ -144,6 +138,27 @@ class HandMouseRuntime:
         self.output.move_to(self.cursor_x, self.cursor_y, duration=0)
         self.emitted += 1
         return True
+
+    def update_cursor(self, index_tip: Tuple[float, float], now: Optional[float] = None) -> bool:
+        """Absolute mode: map the hand's frame position onto a configurable screen region."""
+        if not self.can_emit:
+            # Leave the cursor state untouched: on resume it still matches where the
+            # OS pointer actually is, so the pointer does not jump.
+            return False
+
+        target = map_point_to_screen(
+            index_tip,
+            (self.screen_w, self.screen_h),
+            frame_region=self.frame_region,
+            screen_region=self.screen_region,
+            clamp=True,
+        )
+        if self.config.pointer_scale != 1.0:
+            # Legacy extra gain, kept for anyone who tuned it; 1.0 is the calibrated value.
+            target = (target[0] * self.config.pointer_scale, target[1] * self.config.pointer_scale)
+        target = clamp_point(target, self.screen_w, self.screen_h)
+
+        return self._move_towards(target, now=now)
 
     def hand_is_moving(self, reference: Tuple[float, float]) -> bool:
         """True when the wrist/palm reference shifted more than the jitter deadzone."""
@@ -194,16 +209,7 @@ class HandMouseRuntime:
         if target is None or not self.can_emit:
             return False
 
-        previous = (self.cursor_x, self.cursor_y)
-        smoothed = smooth_point(previous, target, self.config.smoothing)
-        self.cursor_x, self.cursor_y = smoothed
-
-        if not needs_cursor_update(previous, smoothed, self.config.min_move_pixels):
-            return False
-
-        self.output.move_to(self.cursor_x, self.cursor_y, duration=0)
-        self.emitted += 1
-        return True
+        return self._move_towards(target, now=now)
 
     def handle_clicks(
         self,
@@ -307,6 +313,7 @@ class HandMouseRuntime:
             self.current_landmarks = []
             self.last_index = None
             self.last_pointer_ref = None  # re-anchor on reacquire: the cursor must not jump
+            self.cursor_filter.reset()  # Phase 3: drop smoothing state so nothing glides in
             self.last_pinch = False
             self.last_right_click = False
             emitted = 0

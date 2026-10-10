@@ -12,7 +12,6 @@ class HandMouseConfig:
     right_click_threshold: float = 0.08
     scroll_threshold: float = 0.04
     debounce_seconds: float = 0.18
-    pointer_scale: float = 1.8
 
     # --- performance tuning (added 2026-10-10) ------------------------------
     # Measured effects, macOS + FaceTime camera:
@@ -76,3 +75,30 @@ class HandMouseConfig:
     #   Index-finger scrolling only acts while the hand itself is holding still; with
     #   palm-relative pointing, translating the hand would otherwise scroll the page
     #   while it moves the cursor.
+
+    # --- Phase 3: smoothing and screen mapping ------------------------------
+    smoothing_mode: str = "one_euro"
+    #   "one_euro" (default, changed 2026-10-10) = the 1-euro filter: it beat the previous
+    #   EMA on every axis when measured (tools/compare_smoothing.py, 16 seeds): 25% less
+    #   jitter, a 2-frame instead of 6-frame step response, and far less lag on fast
+    #   movement (151 px vs 529 px at 1.0 landmark-units/s). "ema" restores the old feel.
+    one_euro_min_cutoff: float = 1.0
+    #   One Euro cutoff (Hz) when the hand is still; lower is smoother (0.5 gives ~25% less
+    #   jitter than the default but noticeably more lag on slow movement).
+    one_euro_beta: float = 8.0
+    #   How fast the cutoff opens up with hand speed. Measured: beta=8 dominates the old
+    #   EMA at every speed tested; lower values (1-2) filter harder and trail on slow
+    #   movement. The classic 0.007 default assumes pixel units — landmarks are ~1.0 across.
+    one_euro_d_cutoff: float = 1.0
+    #   Cutoff (Hz) for the speed estimate itself.
+    frame_margin: float = 0.15
+    #   Absolute mode only: the inner part of the camera frame that maps to the screen
+    #   (0.15 keeps the middle 70%), so the screen corners are reachable without moving
+    #   your hand to the very edge of the frame.
+    screen_margin: float = 0.0
+    #   Absolute mode only: margin kept free at the screen edges.
+    pointer_scale: float = 1.0
+    #   Extra gain applied after the region mapping (absolute mode only). Was 1.8 with the
+    #   old pointer_scale-times-frame mapping, which skewed the reachable area off-centre;
+    #   the region mapping replaces that job, so 1.0 is the calibrated value. Only change
+    #   it if you want the pointer faster or slower than the frame-to-screen map implies.
