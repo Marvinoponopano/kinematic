@@ -70,6 +70,9 @@ class SyntheticHands:
         gesture: str = "left",
         sweep_reach: int = 0,
         reach_dwell: int = 12,
+        scroll_axis: Optional[str] = None,
+        scroll_amplitude: float = 0.10,
+        scroll_frames: int = 120,
     ) -> None:
         self.real = real
         self.translate = translate
@@ -77,10 +80,28 @@ class SyntheticHands:
         self.gesture = gesture
         self.sweep_reach = sweep_reach
         self.reach_dwell = reach_dwell
+        self.scroll_axis = scroll_axis
+        self.scroll_amplitude = scroll_amplitude
+        self.scroll_frames = max(2, int(scroll_frames))
         #: Which phase of the reach sweep this frame belongs to ("travel" | "dwell"), read by the
         #: reporting code so the two are not averaged into one misleading number.
         self.reach_phase = "travel"
         self.calls = 0
+
+    def scroll_offset(self, step: int) -> Tuple[float, float]:
+        """Where the two-finger reference should be on this step of a controlled scroll sweep.
+
+        A straight line from -amplitude to +amplitude in *frame* units along the chosen axis, so the
+        net hand movement is positive (down / right / both) and the emitted sign can be checked.
+        """
+        span = max(1, self.scroll_frames - 1)
+        progress = min(1.0, max(0.0, (step - 1) / span))
+        delta = -self.scroll_amplitude + 2.0 * self.scroll_amplitude * progress
+        if self.scroll_axis == "vertical":
+            return (0.0, delta)
+        if self.scroll_axis == "horizontal":
+            return (delta, 0.0)
+        return (delta, delta)  # diagonal: both axes, same sign
 
     def reach_target(self, step: int) -> Tuple[float, float]:
         """Where the palm should be on this step of the reach sweep, and whether it is dwelling.
@@ -142,7 +163,12 @@ class SyntheticHands:
         if self.real is not None:
             self.real(rgb)  # keep paying the real MediaPipe cost
         step = self.calls
-        if self.sweep_reach:
+        if self.scroll_axis:
+            # Controlled scroll sweep: the hand stays in the two-finger pose and the reference walks
+            # a straight line, so the emitted sign and the total distance can both be checked.
+            offset = self.scroll_offset(step)
+            index_drop = 0.0
+        elif self.sweep_reach:
             # Walk the palm to each corner and hold it there (see reach_target). Both axes use their
             # own offset because the palm is not centred on the hand's base point.
             palm = self.reach_target(step)
@@ -157,8 +183,10 @@ class SyntheticHands:
         # A realistic tap: pinched for 6 frames every tap_period (0.2 s of a ~1 s cycle). The
         # Phase 4 recogniser only registers a pose that holds for pinch_hold_seconds (0.08 s ≈ 2.4
         # frames at 30 fps), so a single-frame pinch is deliberately ignored.
-        pinching = (step % self.tap_period) < 6
-        pinch_target = self.gesture if pinching else None
+        if self.scroll_axis:
+            pinch_target: Optional[str] = "two_finger"  # held for the whole sweep
+        else:
+            pinch_target = self.gesture if (step % self.tap_period) < 6 else None
         landmarks = [
             SimpleNamespace(x=x, y=y, z=0.0) for x, y in self._hand(offset, index_drop, pinch_target)
         ]
@@ -166,6 +194,25 @@ class SyntheticHands:
 
     def close(self):
         pass
+
+
+def scroll_verdict(axis: str, vertical: int, horizontal: int) -> Tuple[bool, str]:
+    """Did a straight-line scroll sweep come out with the documented sign on the right axis?
+
+    The sweep's net hand movement is positive (down / right / both), so the expectation is:
+    ``vertical`` → the page scrolls **down** (negative units) and nothing sideways; ``horizontal`` →
+    positive horizontal units and no vertical wheel events; ``diagonal`` → both, with those signs.
+    """
+    if axis == "vertical":
+        ok = vertical < 0 and horizontal == 0
+        detail = f"hand down -> {vertical} vertical (page down), no sideways events"
+    elif axis == "horizontal":
+        ok = horizontal > 0 and vertical == 0
+        detail = f"hand right -> +{horizontal} horizontal (scroll right), no vertical events"
+    else:
+        ok = vertical < 0 and horizontal > 0
+        detail = f"hand down-right -> {vertical} vertical, +{horizontal} horizontal"
+    return ok, ("pass - " if ok else "CHECK - ") + detail
 
 
 def main() -> int:
@@ -216,6 +263,45 @@ def main() -> int:
         help="with --synthetic-hand, which pose the periodic tap uses: left pinch (default), right pinch, or a two-finger pinch (scroll)",
     )
     parser.add_argument(
+        "--synthetic-scroll",
+        choices=("vertical", "horizontal", "diagonal"),
+        default=None,
+        help="with --synthetic-hand: hold the two-finger pose and walk the reference in a straight line along this axis, then report the emitted sign and totals per axis",
+    )
+    parser.add_argument(
+        "--scroll-amplitude",
+        type=float,
+        default=0.10,
+        help="half the distance the scroll sweep covers, in frame widths (default 0.10)",
+    )
+    parser.add_argument(
+        "--scroll-frames",
+        type=int,
+        default=120,
+        help="frames one scroll sweep is spread over (default 120, ~4 s at 30 fps)",
+    )
+    parser.add_argument(
+        "--scroll-max-hz",
+        type=float,
+        default=None,
+        help="cap scroll events at this many per second (0 = uncapped, the default); held-back amounts accumulate",
+    )
+    parser.add_argument(
+        "--no-horizontal-scroll",
+        action="store_true",
+        help="turn sideways scrolling off (the pre-Phase-7 behaviour: the horizontal component is computed and dropped)",
+    )
+    parser.add_argument(
+        "--invert-scroll-vertical",
+        action="store_true",
+        help="flip the vertical scroll direction",
+    )
+    parser.add_argument(
+        "--invert-scroll-horizontal",
+        action="store_true",
+        help="flip the horizontal scroll direction",
+    )
+    parser.add_argument(
         "--dial-notches",
         type=int,
         default=0,
@@ -238,16 +324,30 @@ def main() -> int:
         default=12,
         help="frames to hold the palm at each corner during --sweep-reach (default 12, ~0.4 s: what a user does at an edge)",
     )
+    parser.add_argument(
+        "--move-max-hz",
+        type=float,
+        default=None,
+        help="cap cursor moves at this many per second (0 = uncapped, the default); report the loop rate and moves/frame with and without it",
+    )
+    parser.add_argument(
+        "--mouse-pause",
+        type=float,
+        default=None,
+        help="set pyautogui's PAUSE (its own default is 0.1 s per call) to measure what a slow adapter does to the loop rate",
+    )
     args = parser.parse_args()
 
     here = pyautogui.position()
     real_move_to = pyautogui.moveTo
-    calls = {"move": 0, "click": 0, "scroll": 0}
+    calls = {"move": 0, "click": 0, "scroll": 0, "hscroll": 0}
     travel: List[float] = []  # distance of each requested cursor move, in pixels
     previous_point: List[Tuple[float, float]] = []
     reached: Dict[str, List[float]] = {"x": [], "y": []}  # every requested coordinate, for the sweep
     reached_phase: List[str] = []  # "travel" | "dwell", so the two are reported separately
     phase_of: List[str] = ["travel"]  # set by the synt.*hook below; a list so the closure sees updates
+    scroll_amounts: List[int] = []  # every vertical scroll amount, for the direction check
+    hscroll_amounts: List[int] = []  # every horizontal scroll amount
 
     def counted_move_to(x, y, duration=0, **kwargs):
         calls["move"] += 1
@@ -259,9 +359,18 @@ def main() -> int:
         reached_phase.append(phase_of[0])
         return real_move_to(here.x, here.y, duration=duration, **kwargs)
 
+    def counted_scroll(amount, **kwargs):
+        calls["scroll"] += 1
+        scroll_amounts.append(int(amount))
+
+    def counted_hscroll(amount, **kwargs):
+        calls["hscroll"] += 1
+        hscroll_amounts.append(int(amount))
+
     pyautogui.moveTo = counted_move_to
     pyautogui.click = lambda *a, **k: calls.__setitem__("click", calls["click"] + 1)
-    pyautogui.scroll = lambda *a, **k: calls.__setitem__("scroll", calls["scroll"] + 1)
+    pyautogui.scroll = counted_scroll
+    pyautogui.hscroll = counted_hscroll
 
     overrides = {"show_preview": args.preview, "start_paused": not args.active}
     if args.pointer_mode is not None:
@@ -274,6 +383,18 @@ def main() -> int:
         overrides["pointer_sensitivity"] = args.sensitivity
     if args.sensitivity_step is not None:
         overrides["sensitivity_step"] = args.sensitivity_step
+    if args.move_max_hz is not None:
+        overrides["move_max_hz"] = args.move_max_hz
+    if args.mouse_pause is not None:
+        overrides["mouse_pause"] = args.mouse_pause
+    if args.scroll_max_hz is not None:
+        overrides["scroll_max_hz"] = args.scroll_max_hz
+    if args.no_horizontal_scroll:
+        overrides["scroll_horizontal_gain"] = 0.0
+    if args.invert_scroll_vertical:
+        overrides["scroll_invert_vertical"] = True
+    if args.invert_scroll_horizontal:
+        overrides["scroll_invert_horizontal"] = True
     config = HandMouseConfig(**overrides)
     app = HandMouseApp(config)
     seen = {"n": 0}
@@ -286,6 +407,9 @@ def main() -> int:
             gesture=args.synthetic_pinch,
             sweep_reach=args.sweep_reach,
             reach_dwell=args.reach_dwell,
+            scroll_axis=args.synthetic_scroll,
+            scroll_amplitude=args.scroll_amplitude,
+            scroll_frames=args.scroll_frames,
         )
         reach_phase_source = app.runtime.hands
         real_process = app.runtime.hands.process
@@ -353,6 +477,58 @@ def main() -> int:
                   f"{mean_after:.1f} px over {len(after)} after "
                   f"({mean_after / mean_before if mean_before else 0:.2f}x)")
     print(f"status           : {app.status}")
+    if args.synthetic_hand and not args.synthetic_scroll:
+        # The verification half of Phase 6: the synthetic hand taps on a fixed period, so the click
+        # count can be checked against the taps that were actually offered. One click per deliberate
+        # tap is the recogniser's contract; the legacy engine may fire two per tap (its left and
+        # right tests can both see the same pose). Skipped for a scroll sweep, where the hand holds
+        # the scroll pose for the whole run and there is no tap to count.
+        synthetic = app.runtime.hands
+        period = max(1, int(getattr(synthetic, "tap_period", 30) or 30))
+        taps = synthetic.calls // period
+        clicks, scrolls = calls["click"], calls["scroll"]
+        print(f"taps offered     : {taps} ({synthetic.calls} frames, pinched for 6 of every {period})")
+        if not taps:
+            print("click verdict    : n/a (no tap fitted in the run)")
+        elif args.synthetic_pinch == "two_finger":
+            if app.config.gesture_engine == "recognizer":
+                ok = clicks == 0 and scrolls > 0
+                detail = "the scroll pose scrolls and never clicks"
+            else:
+                # Documented pre-Phase-4 behaviour: the two-finger pose right-clicked instead.
+                ok = clicks > 0 and scrolls == 0
+                detail = "legacy clicks on this pose instead of scrolling"
+            print(f"click verdict    : {'pass' if ok else 'CHECK'} - {detail} "
+                  f"({clicks} clicks, {scrolls} scrolls)")
+        elif app.config.gesture_engine == "recognizer":
+            ok = clicks == taps
+            print(f"click verdict    : {'pass' if ok else 'CHECK'} - one click per deliberate tap "
+                  f"({clicks} clicks for {taps} taps)")
+        else:
+            ok = taps <= clicks <= 2 * taps
+            print(f"click verdict    : {'ok' if ok else 'CHECK'} for the legacy engine "
+                  f"({clicks} clicks for {taps} taps: its left and right tests can both fire on one pose)")
+        print(f"gesture counts   : last action {app.last_action!r}, {app.actions()}")
+    if args.synthetic_scroll:
+        # Phase 7's direction check: a controlled straight-line sweep at a known amplitude, with the
+        # wheel calls intercepted, so the sign on each axis can be checked without scrolling anything.
+        total_v, total_h = sum(scroll_amounts), sum(hscroll_amounts)
+        ok, verdict = scroll_verdict(args.synthetic_scroll, total_v, total_h)
+        print(
+            f"scroll sweep     : {args.synthetic_scroll} axis, amplitude {args.scroll_amplitude} frame widths "
+            f"over {args.scroll_frames} frames"
+        )
+        print(f"  vertical wheel  : {len(scroll_amounts)} events, {total_v} units total")
+        print(f"  horizontal wheel: {len(hscroll_amounts)} events, {total_h} units total")
+        print(f"  direction       : {verdict}")
+        print(
+            f"  event cap       : "
+            + (
+                f"{app.config.scroll_max_hz:g} Hz, {app.runtime.scroll_limiter.suppressed} frames held and accumulated"
+                if app.config.scroll_max_hz
+                else "off (one event per due frame)"
+            )
+        )
     if args.sweep_reach and reached["x"]:
         # Sub-pixel tolerance: the cursor filter lands a hair inside the edge (e.g. 1709.9999), which
         # is the edge as far as the pointer is concerned. The tolerance is the *move guard's* rest

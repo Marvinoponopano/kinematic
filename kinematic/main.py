@@ -90,6 +90,14 @@ def parse_args(argv: Optional[list] = None) -> argparse.Namespace:
         action="store_true",
         help="do not open the preview window (quit with Ctrl-C instead of q)",
     )
+    parser.add_argument(
+        "--preview-flip",
+        choices=("horizontal", "none", "vertical", "both"),
+        default=None,
+        help="how the preview footage is flipped for display: horizontal (default, the mirror a webcam "
+        "selfie shows and the view the pointer follows), none (exactly what the camera delivers), "
+        "vertical or both (camera mounted upside down)",
+    )
     parser.add_argument("--camera", type=int, default=None, help="camera index to open (default: 0)")
     parser.add_argument(
         "--pointer-mode",
@@ -127,6 +135,39 @@ def parse_args(argv: Optional[list] = None) -> argparse.Namespace:
         default=None,
         help="gesture logic: recognizer (default, relative thresholds + state machine) or legacy (the pre-Phase-4 inline pinch/scroll tests)",
     )
+    parser.add_argument(
+        "--move-max-hz",
+        type=float,
+        default=None,
+        help="cap cursor moves at this many per second, always sending the newest position (default 0 = no cap: the loop is camera-bound and already emits one move per frame)",
+    )
+    parser.add_argument(
+        "--scroll-max-hz",
+        type=float,
+        default=None,
+        help="cap scroll events at this many per second; held-back amounts are accumulated, never dropped (default 0 = no cap)",
+    )
+    parser.add_argument(
+        "--scroll-horizontal-gain",
+        type=float,
+        default=None,
+        help="horizontal scroll units per hand width (default 900); 0 disables sideways scrolling",
+    )
+    parser.add_argument(
+        "--no-horizontal-scroll",
+        action="store_true",
+        help="never scroll sideways: the pre-Phase-7 behaviour, where only the vertical component was emitted",
+    )
+    parser.add_argument(
+        "--invert-scroll-vertical",
+        action="store_true",
+        help="flip the vertical scroll direction (default: hand down scrolls the page down)",
+    )
+    parser.add_argument(
+        "--invert-scroll-horizontal",
+        action="store_true",
+        help="flip the horizontal scroll direction if it feels backwards",
+    )
     return parser.parse_args(argv)
 
 
@@ -138,6 +179,8 @@ def build_config(args: argparse.Namespace) -> HandMouseConfig:
         overrides["start_paused"] = False
     if args.no_preview:
         overrides["show_preview"] = False
+    if args.preview_flip is not None:
+        overrides["preview_flip"] = args.preview_flip
     if args.camera is not None:
         overrides["camera_index"] = args.camera
     if args.pointer_mode is not None:
@@ -152,6 +195,18 @@ def build_config(args: argparse.Namespace) -> HandMouseConfig:
         overrides["pointer_sensitivity"] = args.sensitivity
     if args.sensitivity_step is not None:
         overrides["sensitivity_step"] = args.sensitivity_step
+    if args.move_max_hz is not None:
+        overrides["move_max_hz"] = args.move_max_hz
+    if args.scroll_max_hz is not None:
+        overrides["scroll_max_hz"] = args.scroll_max_hz
+    if args.scroll_horizontal_gain is not None:
+        overrides["scroll_horizontal_gain"] = args.scroll_horizontal_gain
+    if args.no_horizontal_scroll:
+        overrides["scroll_horizontal_gain"] = 0.0
+    if args.invert_scroll_vertical:
+        overrides["scroll_invert_vertical"] = True
+    if args.invert_scroll_horizontal:
+        overrides["scroll_invert_horizontal"] = True
     return HandMouseConfig(**overrides)
 
 
@@ -194,6 +249,27 @@ def main(argv: Optional[list] = None) -> int:
         f"{runtime.config.sensitivity_step}x per turn, reach {runtime.reach:.2f} screens per frame width)"
     )
     print("kinematic: turn the dial with ] (faster) and [ (slower); 0 resets it to where you started")
+    horizontal = runtime.config.scroll_horizontal_gain
+    print(
+        f"kinematic: two-finger scroll vertical gain={runtime.config.scroll_gain} "
+        f"horizontal={'OFF (pre-Phase-7)' if horizontal == 0 else f'gain={horizontal}'} "
+        f"deadzone={runtime.config.scroll_deadzone_ratio} hand widths "
+        f"invert v/h={runtime.config.scroll_invert_vertical}/{runtime.config.scroll_invert_horizontal} "
+        f"{'events capped at ' + format(runtime.config.scroll_max_hz, 'g') + ' Hz' if runtime.config.scroll_max_hz else 'no event cap'}"
+    )
+    if runtime.config.move_max_hz > 0:
+        print(
+            f"kinematic: cursor moves capped at {runtime.config.move_max_hz:g} Hz "
+            "(the newest position wins; measure the cost with tools/measure_smoothness.py --rate-sweep)"
+        )
+    else:
+        print("kinematic: cursor moves not capped (one per frame; --move-max-hz N to cap them)")
+    if runtime.config.show_last_action:
+        print("kinematic: the preview shows the last click/scroll emitted, which is also how the dry run shows it")
+    print(
+        f"kinematic: preview flip={runtime.config.preview_flip} "
+        "(horizontal = the webcam mirror the pointer follows; none = exactly what the camera delivers)"
+    )
     if runtime.sensitivity_clamped_from is not None:
         print(
             f"kinematic: requested sensitivity {runtime.sensitivity_clamped_from} is below the reach "
@@ -223,6 +299,11 @@ def main(argv: Optional[list] = None) -> int:
         )
         if summary["recorded"]:
             print(f"kinematic: recorded (not sent) {summary['recorded']}")
+        if summary["actions"]:
+            print(
+                f"kinematic: actions emitted {summary['actions']} (last: {summary['last_action']}, "
+                f"cursor moves thinned by the rate limit: {summary['moves_suppressed']})"
+            )
         app.close()
     return 0
 

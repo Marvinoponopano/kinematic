@@ -18,7 +18,11 @@ Reported per path:
 * **step CV** — coefficient of variation of the step sizes. A constant-velocity hand should produce
   near-constant steps (low CV); snapping produces a mix of zeros and big jumps (high CV);
 * **lag px** — mean distance between the cursor and the straight line the hand is following, after the
-  warm-up. This is what smoothing *costs*: a heavier filter trails further behind.
+  warm-up, sampled on the frame each move was emitted on. This is what smoothing *costs*: a heavier
+  filter trails further behind;
+* **ends short px** — how far behind the hand the cursor was on the last frame it moved. Like the lag
+  this is sampled on the frames that were emitted, so a rate limit changes *how often* the cursor
+  updates (moves/held, step size) rather than how far behind it is when it does.
 
 The hand is synthetic and seeded, so every number here is reproducible without a camera.
 
@@ -97,6 +101,9 @@ def run_path(name: str, config: HandMouseConfig, jitter: float, seed: int, warmu
 
     Steps and lag are measured *after* ``warmup`` moves, so the cursor settling onto the hand at the
     start of the path (a decaying convergence from wherever it was) is not mistaken for stepping.
+    Lags are sampled at the *frame each move was emitted on*, not at its index in the move list —
+    with the rate limit on, move #i happens several frames in, and sampling by move index would
+    report the gap between the cursor and a point the hand has not reached yet.
     """
     rng = random.Random(seed)
     output = RecordingMouseOutput()
@@ -104,7 +111,18 @@ def run_path(name: str, config: HandMouseConfig, jitter: float, seed: int, warmu
     start, end, frames = PATHS[name]
     start_px, end_px = ideal_screen_path(name, runtime.screen_w)
 
+    frame_index = [-1]
+    emitted_at: List[int] = []
+    real_move_to = output.move_to
+
+    def move_to(x: float, y: float, duration: float = 0.0) -> None:
+        emitted_at.append(frame_index[0])
+        real_move_to(x, y, duration=duration)
+
+    output.move_to = move_to  # type: ignore[assignment]
+
     for index in range(frames):
+        frame_index[0] = index
         progress = index / max(1, frames - 1)
         palm = (
             start + (end - start) * progress + rng.gauss(0.0, jitter),
@@ -114,15 +132,13 @@ def run_path(name: str, config: HandMouseConfig, jitter: float, seed: int, warmu
 
     positions = [event.value[0] for event in output.moves]
     empty = {"path": name, "moves": 0, "held": frames, "mean": 0.0, "p50": 0.0, "p95": 0.0, "max": 0.0,
-             "cv": 0.0, "lag": 0.0, "settle": 0.0}
+             "cv": 0.0, "lag": 0.0, "settle": 0.0, "travel": 0.0, "end": 0.0, "end_shortfall": 0.0}
     if not positions:
         return empty
 
-    # Where the cursor *should* be for each emitted move: the moves are not one per frame (held frames
-    # emit nothing), so the ideal is sampled at the same spacing as the moves.
-    samples = [
-        start_px + (end_px - start_px) * (i / max(1, frames - 1)) for i in range(len(positions))
-    ]
+    # Where the cursor *should* be on the frame each move was emitted (moves are not one per frame:
+    # held frames emit nothing, and a rate limit drops moves outright).
+    samples = [start_px + (end_px - start_px) * (frame / max(1, frames - 1)) for frame in emitted_at]
     steady = slice(warmup, len(positions))
     steps = [positions[i] - positions[i - 1] for i in range(max(1, warmup), len(positions))]
     sizes = [abs(step) for step in steps]
@@ -142,16 +158,22 @@ def run_path(name: str, config: HandMouseConfig, jitter: float, seed: int, warmu
         "cv": (statistics.pstdev(sizes) / statistics.fmean(sizes)) if len(sizes) > 1 and statistics.fmean(sizes) else 0.0,
         "lag": lag,
         "settle": settle,
+        # `travel` is the post-warm-up distance the cursor actually covered, and `end_shortfall` is
+        # how far behind the hand it finished. A rate limit defers movement rather than losing it,
+        # so both change only a little: what it really changes is `moves`/`held` and the step size.
+        "travel": sum(sizes),
+        "end": positions[-1],
+        "end_shortfall": abs(positions[-1] - samples[-1]),
     }
 
 
 def report(rows: Sequence[Dict[str, Any]], title: str) -> None:
     print(f"\n{title}")
-    print(f"  {'path':6} {'moves':>6} {'held':>5} {'step mean':>10} {'p50':>7} {'p95':>7} {'max':>7} {'step CV':>8} {'lag':>7}")
+    print(f"  {'path':6} {'moves':>6} {'held':>5} {'step mean':>10} {'p50':>7} {'p95':>7} {'max':>7} {'step CV':>8} {'lag':>7} {'ends short':>10}")
     for row in rows:
         print(
             f"  {row['path']:6} {row['moves']:6d} {row['held']:5d} {row['mean']:10.1f} {row['p50']:7.1f} "
-            f"{row['p95']:7.1f} {row['max']:7.1f} {row['cv']:8.2f} {row['lag']:7.1f}"
+            f"{row['p95']:7.1f} {row['max']:7.1f} {row['cv']:8.2f} {row['lag']:7.1f} {row['end_shortfall']:10.1f}"
         )
 
 
@@ -166,7 +188,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--min-move-px", type=float, default=None, help="override min_move_pixels (default 0.5)")
     parser.add_argument("--smoothing", type=float, default=None, help="override the EMA factor (default 0.35)")
     parser.add_argument("--pointer-mode", choices=("absolute", "relative"), default=None)
+    parser.add_argument("--move-max-hz", type=float, default=None, help="override move_max_hz (0 = uncapped)")
     parser.add_argument("--sweep", action="store_true", help="compare several configurations")
+    parser.add_argument("--rate-sweep", action="store_true", help="compare move_max_hz settings (0 = uncapped)")
     parser.add_argument("--compare-relative", action="store_true", help="also run the paths in relative mode")
     args = parser.parse_args(argv)
 
@@ -185,6 +209,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         overrides["smoothing"] = args.smoothing
     if args.pointer_mode is not None:
         overrides["pointer_mode"] = args.pointer_mode
+    if args.move_max_hz is not None:
+        overrides["move_max_hz"] = args.move_max_hz
     config = HandMouseConfig(**overrides)
 
     print(
@@ -193,6 +219,18 @@ def main(argv: Optional[List[str]] = None) -> int:
     )
     print(f"deadzone {config.deadzone} ({config.deadzone / 0.70 * 1710:.1f} px of screen), "
           f"smoothing {config.smoothing_mode} min_cutoff={config.one_euro_min_cutoff} beta={config.one_euro_beta}")
+    print(f"move rate limit {config.move_max_hz:g} Hz" + ("" if config.move_max_hz else " (uncapped)"))
+
+    if args.rate_sweep:
+        # Phase 5: what a cap on the move rate costs. Held frames rise and steps grow as the cap
+        # falls, while travel and the end position stay put — the cursor still covers the path, it
+        # just does it in fewer, larger steps. That trade is the reason the default is uncapped.
+        for hz in (0.0, 30.0, 20.0, 15.0, 10.0, 5.0):
+            sweep_config = HandMouseConfig(**{**overrides, "move_max_hz": hz})
+            rows = [run_path(name, sweep_config, args.jitter, args.seed) for name in PATHS]
+            label = " (uncapped, the shipped default)" if hz == 0.0 else ""
+            report(rows, f"move_max_hz={hz:g}{label}")
+        return 0
 
     if args.sweep:
         for deadzone in (0.02, 0.005, 0.002, 0.0):

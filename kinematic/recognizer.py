@@ -80,9 +80,20 @@ class GestureThresholds:
     cooldown_seconds: float = 0.18
     #   Two clicks are never closer than this; a click inside the window is dropped, not deferred.
     scroll_deadzone_ratio: float = 0.05
-    #   Scroll reference movement below this (in hand widths) is ignored, and accumulates.
+    #   Scroll reference movement below this (in hand widths) is ignored, and accumulates. Applied
+    #   per axis, so sideways wobble during a vertical scroll does not scroll sideways.
     scroll_gain: float = 900.0
-    #   Scroll units per hand-width of reference movement (the old hard-coded -900).
+    #   Vertical scroll units per hand-width of reference movement (the old hard-coded 900).
+    scroll_horizontal_gain: float = 900.0
+    #   Horizontal scroll units per hand-width. 0 turns horizontal scrolling off, which reproduces
+    #   the pre-Phase-7 behaviour of dropping the sideways component (it was computed and reported,
+    #   never emitted).
+    invert_vertical: bool = False
+    #   Flip the vertical direction: the default is hand down = page down.
+    invert_horizontal: bool = False
+    #   Flip the horizontal direction. Which way Quartz's positive horizontal wheel value moves the
+    #   content is inherited from macOS rather than measured here (scrolling the user's screen to
+    #   find out is not a thing this suite does), so this is the one-field switch for it.
     require_neutral_between: bool = True
     #   A gesture cannot follow a different gesture without a neutral frame in between.
 
@@ -95,6 +106,12 @@ class GestureThresholds:
             raise ValueError(f"hold_seconds must be >= 0, got {self.hold_seconds}")
         if self.cooldown_seconds < 0.0:
             raise ValueError(f"cooldown_seconds must be >= 0, got {self.cooldown_seconds}")
+        if self.scroll_gain < 0.0:
+            raise ValueError(f"scroll_gain must be >= 0 (use invert_vertical), got {self.scroll_gain}")
+        if self.scroll_horizontal_gain < 0.0:
+            raise ValueError(
+                f"scroll_horizontal_gain must be >= 0 (use invert_horizontal), got {self.scroll_horizontal_gain}"
+            )
 
 
 @dataclass(frozen=True)
@@ -122,6 +139,9 @@ def thresholds_from_config(config: Any) -> GestureThresholds:
         cooldown_seconds=float(getattr(config, "click_cooldown_seconds", 0.18)),
         scroll_deadzone_ratio=float(getattr(config, "scroll_deadzone_ratio", 0.05)),
         scroll_gain=float(getattr(config, "scroll_gain", 900.0)),
+        scroll_horizontal_gain=float(getattr(config, "scroll_horizontal_gain", 900.0)),
+        invert_vertical=bool(getattr(config, "scroll_invert_vertical", False)),
+        invert_horizontal=bool(getattr(config, "scroll_invert_horizontal", False)),
     )
 
 
@@ -354,16 +374,42 @@ class GestureRecognizer:
         dx = reference[0] - self._scroll_reference[0]
         dy = reference[1] - self._scroll_reference[1]
         deadzone = self.thresholds.scroll_deadzone_ratio * (self._last_scale or 0.0)
-        vertical = -dy * self.thresholds.scroll_gain
-        horizontal = dx * self.thresholds.scroll_gain
 
-        if abs(dy) < deadzone and abs(dx) < deadzone:
-            # Below the dead zone: hold the reference so slow movement accumulates rather than
-            # being thrown away.
+        # The dead zone is applied *per axis*: a hand moving vertically with a little sideways wobble
+        # must scroll vertically only. While the horizontal component was dropped by the runtime the
+        # two axes moved together (one over the zone meant both were sent), which would now put that
+        # wobble on screen as sideways scrolling.
+        moving_vertically = abs(dy) >= deadzone
+        moving_horizontally = abs(dx) >= deadzone
+        if not moving_vertically and not moving_horizontally:
+            # Below the dead zone on both axes: hold the reference so slow movement accumulates
+            # rather than being thrown away.
             return []
 
+        vertical = self._axis_amount(dy, self.thresholds.scroll_gain, self.thresholds.invert_vertical, -1.0)
+        horizontal = self._axis_amount(
+            dx, self.thresholds.scroll_horizontal_gain, self.thresholds.invert_horizontal, 1.0
+        )
         self._scroll_reference = reference
-        return [GestureEvent(EventKind.SCROLL, value=vertical, secondary=horizontal)]
+        return [
+            GestureEvent(
+                EventKind.SCROLL,
+                value=vertical if moving_vertically else 0.0,
+                secondary=horizontal if moving_horizontally else 0.0,
+            )
+        ]
+
+    @staticmethod
+    def _axis_amount(delta: float, gain: float, invert: bool, sign: float) -> float:
+        """One axis' scroll amount: *delta* × *gain* × the axis' convention, flipped by ``invert``.
+
+        ``sign`` is the OS wheel convention for a hand moving in the *positive* direction on that
+        axis: **-1** for vertical (a hand moving down scrolls the page down, while a positive wheel
+        value scrolls up) and **+1** for horizontal. ``invert`` is the per-axis direction switch, and
+        it lives here rather than in the adapter because this module is where a hand movement becomes
+        a scroll amount.
+        """
+        return delta * gain * (-sign if invert else sign)
 
 
 def timestamp() -> float:

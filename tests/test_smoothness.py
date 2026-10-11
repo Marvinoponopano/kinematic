@@ -168,7 +168,9 @@ class NoSnappingTests(unittest.TestCase):
     def test_the_old_deadzone_still_measurably_degrades_a_slow_sweep(self):
         # It no longer freezes outright (the smoother filter creeps toward the frozen anchor), but it
         # is still clearly worse: fewer frames move, the steps that do arrive are bigger and uneven,
-        # and the cursor trails the hand by ~39 px more. The default is 0; this is the evidence.
+        # and the cursor trails the hand by ~15 px more. The default is 0; this is the evidence.
+        # (The tool samples the ideal path on the frame each move was emitted on — the earlier
+        # move-index sampling mixed the sample spacing into the number and reported +39 px.)
         slow_rows = {
             deadzone: _tool_row("slow", deadzone=deadzone)
             for deadzone in (0.0, 0.02)
@@ -181,7 +183,7 @@ class NoSnappingTests(unittest.TestCase):
         self.assertGreater(snapped["held"], 10, "the deadzone should hold frames")
         self.assertGreater(snapped["max"], 25.0, "the deadzone should produce jumps")
         self.assertGreater(snapped["cv"], 0.8, "the deadzone's steps should be uneven")
-        self.assertGreater(snapped["lag"], smooth["lag"] + 20.0, "the deadzone should add trailing")
+        self.assertGreater(snapped["lag"], smooth["lag"] + 10.0, "the deadzone should add trailing")
 
     def test_the_deadzone_is_a_radius_not_a_per_axis_box(self):
         # A slow diagonal move must not be frozen because one axis is inside the box: with a radius

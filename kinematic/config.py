@@ -38,6 +38,13 @@ class HandMouseConfig:
     mouse_pause: float = 0.0
     min_move_pixels: float = 0.5
     preview_scale: float = 0.5
+    preview_flip: str = "horizontal"
+    #   Which way the preview footage is flipped for display, named as a flip of the *captured* frame:
+    #   "horizontal" (default) shows the mirror a webcam selfie shows; "none" shows exactly what the
+    #   camera delivers; "vertical" / "both" are for a camera mounted upside down. It also decides how
+    #   the landmark skeleton is mirrored so it lands *on* the hand rather than reflected beside it —
+    #   and since MediaPipe analyses the mirrored frame, "horizontal" is the orientation in which the
+    #   pointer follows your hand on screen (hand right = cursor right). Change it with --preview-flip.
     show_preview: bool = True
     show_fps: bool = True
     show_landmarks: bool = True
@@ -156,12 +163,48 @@ class HandMouseConfig:
     click_cooldown_seconds: float = 0.18
     #   Minimum spacing between two clicks; a click inside the window is dropped, not deferred.
     scroll_deadzone_ratio: float = 0.05
-    #   Two-finger movement below this (in hand widths) is ignored and accumulates.
+    #   Two-finger movement below this (in hand widths) is ignored and accumulates. Applied per axis
+    #   since 2026-10-11, so a hand scrolling vertically with a little sideways wobble scrolls
+    #   vertically only.
     scroll_gain: float = 900.0
-    #   Scroll units per hand width of two-finger movement (the old hard-coded 900).
+    #   Scroll units per hand width of two-finger movement (the old hard-coded 900). Positive hand
+    #   movement down = page down; `scroll_invert_vertical` flips it.
+    scroll_horizontal_gain: float = 900.0
+    #   Horizontal scroll units per hand width (Phase 7). 0.0 turns sideways scrolling off, which is
+    #   exactly the pre-Phase-7 behaviour: the horizontal component was computed and reported but
+    #   never emitted. See `--no-horizontal-scroll`.
+    scroll_invert_vertical: bool = False
+    #   Flip the vertical scroll direction (default: hand down = page down).
+    scroll_invert_horizontal: bool = False
+    #   Flip the horizontal scroll direction. Which way macOS's positive horizontal wheel value moves
+    #   the content is inherited from Quartz rather than measured here — scrolling the user's screen
+    #   to find out is not something this project does — so this field is the one-field fix if it
+    #   feels backwards (see AGENTS.md §2 "Two-finger scrolling").
+    scroll_max_hz: float = 0.0
+    #   Cap on scroll events per second, 0 = uncapped (the measured default: the loop is camera-bound
+    #   and a scroll costs ~11 ms, so one event per frame already happens). When set, held-back frames
+    #   are *accumulated* rather than dropped, so the rate falls and the distance scrolled does not.
 
     pointer_scale: float = 1.0
     #   Extra gain applied after the region mapping (absolute mode only). Was 1.8 with the
     #   old pointer_scale-times-frame mapping, which skewed the reachable area off-centre;
     #   the region mapping replaces that job, so 1.0 is the calibrated value. Only change
     #   it if you want the pointer faster or slower than the frame-to-screen map implies.
+
+    # --- Phase 5: cursor move rate limit / coalescer -------------------------
+    move_max_hz: float = 0.0
+    #   0 (default) = no limit, and that is the measured status quo rather than a guess: the loop
+    #   is camera-bound at ~30 fps and a move costs ~11 ms, so one move per frame already happens
+    #   and the output path is about a third of the frame budget. A value > 0 emits at most that
+    #   many cursor moves per second and always sends the *newest* position (a frame inside the
+    #   interval is superseded, never queued), which is what keeps the loop responsive when the
+    #   adapter is slow — e.g. mouse_pause at pyautogui's own 0.1 s default makes every move cost
+    #   ~113 ms, longer than the 33 ms frame interval. Lower limits mean fewer, larger steps: the
+    #   held-then-jump feel the smoothness work removed. Measure it with
+    #   `python3 tools/measure_smoothness.py --rate-sweep` before choosing a value.
+    show_last_action: bool = True
+    #   Phase 6: draw the last click/scroll the recogniser emitted, how long ago, and how many
+    #   have fired this session (`last: left click  1.2s ago  (3 this session)`). It appears on the
+    #   line below the sensitivity dial once the first action has fired, and it is the readout the
+    #   manual click verification procedure uses — including under --dry-run, where it shows what
+    #   *would* have been sent without anything reaching the desktop.

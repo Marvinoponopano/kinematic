@@ -40,11 +40,29 @@ def landmark_points(landmarks: Sequence[object]) -> list[Point]:
     return [(landmark.x, landmark.y) for landmark in landmarks]
 
 
-def is_pinch(landmarks: Sequence[object], threshold: float = 0.06) -> bool:
+#: The distance metrics :func:`is_pinch` understands. ``"euclidean"`` is the straight-line
+#: distance; ``"l1"`` is ``|dx| + |dy|``, which is what the pre-Phase-4 code wrote out inline.
+PINCH_METRICS = ("euclidean", "l1")
+
+
+def is_pinch(landmarks: Sequence[object], threshold: float = 0.06, metric: str = "euclidean") -> bool:
+    """True when the thumb and index tips are closer together than *threshold*.
+
+    The metric is an explicit argument rather than an accident of where the test was written:
+    ``"euclidean"`` (default) is what the recogniser's hand-scale-relative ratios are built on,
+    and ``"l1"`` reproduces the inline ``abs(dx) + abs(dy)`` test exactly, so the legacy engine can
+    call this one helper without its feel changing (L1 is always >= the Euclidean distance, so at
+    the same threshold it engages slightly less readily).
+    """
+    if metric not in PINCH_METRICS:
+        raise ValueError(f"unknown metric {metric!r}: expected one of {PINCH_METRICS}")
     points = landmark_points(landmarks)
     if len(points) < 21:
         return False
-    return point_distance(points[4], points[8]) < threshold
+    thumb, index = points[4], points[8]
+    if metric == "l1":
+        return abs(thumb[0] - index[0]) + abs(thumb[1] - index[1]) < threshold
+    return point_distance(thumb, index) < threshold
 
 
 def is_right_click_gesture(landmarks: Sequence[object], threshold: float = 0.08) -> bool:

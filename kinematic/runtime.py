@@ -12,7 +12,7 @@ Phase 1 defines this coordinator with the safety behaviour; later phases extend 
 
 import math
 import time
-from typing import Any, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import cv2
 import mediapipe as mp
@@ -21,11 +21,12 @@ import numpy as np
 from .capture import ThreadedCamera
 from .config import HandMouseConfig
 from .landmarks import HandLandmarks, hands_from_results
-from .preview import draw_hands
+from .preview import display_frame, draw_hands, landmark_flip
 from .gesture import (
     clamp,
     clamp_point,
     hand_scale,
+    is_pinch,
     is_right_click_gesture,
     landmark_point,
     needs_cursor_update,
@@ -38,6 +39,7 @@ from .gesture import (
 )
 from .mapping import Region, map_point_to_screen
 from .output import MouseOutput, RealMouseOutput, RecordingMouseOutput
+from .ratelimit import MoveRateLimiter, ScrollRateLimiter
 from .recognizer import (
     EventKind,
     GestureEvent,
@@ -79,6 +81,15 @@ class HandMouseRuntime:
         self.last_pinch = False
         self.last_right_click = False
         self.last_action_at = 0.0
+        # Phase 6: the last click/scroll that was actually emitted, plus per-kind counts, for the
+        # preview's last-action line, the summary and the manual click verification procedure.
+        self.last_action: Optional[str] = None
+        self.action_counts: Dict[str, int] = {}
+        # Phase 5: the optional move rate limiter/coalescer (off by default; see ratelimit.py).
+        self.move_limiter = MoveRateLimiter(self.config.move_max_hz)
+        # Phase 7: the same idea for scroll events, but accumulating instead of superseding — a scroll
+        # amount is a delta, so a held frame must not be thrown away.
+        self.scroll_limiter = ScrollRateLimiter(self.config.scroll_max_hz)
         self.current_landmarks: Any = []  # the first hand (HandLandmarks) or [] — kept for the facade
         self.current_hands: List[HandLandmarks] = []
         self.loop_fps = 0.0
@@ -155,6 +166,9 @@ class HandMouseRuntime:
         """
         self.gesture.set_paused(self.paused)
         self.gesture_state = self.gesture.state
+        # A pause/resume ends any scroll in flight (the recogniser says so), so the scroll limiter's
+        # accumulated remainder goes with it: it belongs to movement that is over.
+        self.scroll_limiter.reset()
 
     def handle_key(self, key: int) -> bool:
         """Act on a ``cv2.waitKey()`` code. Returns True when the loop should stop."""
@@ -291,12 +305,44 @@ class HandMouseRuntime:
         if not needs_cursor_update(previous, smoothed, self.config.min_move_pixels):
             return False
 
+        # Phase 5: the optional output rate limit. It runs last, after the move guard, so a frame
+        # too small to be worth a move is not even offered. When a frame is inside the interval
+        # this returns False and the frame's position is simply superseded by the next due frame —
+        # the limiter stores nothing, so no stale position can be sent late. Off by default (0 Hz).
+        if not self.move_limiter.offer(now if now is not None else time.monotonic()):
+            return False
+
         # duration stays 0: pyautogui tweens only above its MINIMUM_DURATION of 0.1 s, and a tween
         # that long blocks the loop for ~171 ms (5 frame intervals) — measured in
         # tools/measure_smoothness.py's notes, so there is no usable per-frame tween on this stack.
         self.output.move_to(self.cursor_x, self.cursor_y, duration=0)
         self.emitted += 1
         return True
+
+    # -- Phase 6: last-action status ------------------------------------------
+
+    def _record_action(self, kind: str, now: float) -> None:
+        """Remember the click/scroll that was just emitted, for the preview and the summary.
+
+        Only *emitted* actions are recorded: the line says what reached the desktop (or, under
+        --dry-run, what would have), which is exactly what makes it usable as a verification
+        readout. ``last_action_at`` doubles as the legacy engine's debounce clock, as before.
+        """
+        self.last_action = kind
+        self.last_action_at = float(now)
+        self.action_counts[kind] = self.action_counts.get(kind, 0) + 1
+
+    def last_action_text(self, now: Optional[float] = None) -> str:
+        """One line: the last clicked/scrolled action, its age, and the session's count."""
+        if self.last_action is None:
+            return "last: none yet"
+        age = max(0.0, (time.monotonic() if now is None else float(now)) - self.last_action_at)
+        count = self.action_counts.get(self.last_action, 0)
+        return f"last: {self.last_action}  {age:.1f}s ago  ({count} this session)"
+
+    def actions(self) -> Dict[str, int]:
+        """Per-kind counts of the clicks/scrolled actions emitted this session."""
+        return dict(self.action_counts)
 
     def update_cursor(self, index_tip: Tuple[float, float], now: Optional[float] = None) -> bool:
         """Absolute mode: map the hand's frame position onto a configurable screen region."""
@@ -377,15 +423,29 @@ class HandMouseRuntime:
         index_tip: Tuple[float, float],
         thumb_tip: Tuple[float, float],
         now: Optional[float] = None,
+        landmarks: Optional[Any] = None,
     ) -> bool:
+        """The **legacy** engine's click path (``gesture_engine="legacy"``): the pre-Phase-4
+        inline L1 pinch test, one-shot left click and the old right-click gesture.
+
+        The pinch comparison is no longer written out here: it calls :func:`gesture.is_pinch` —
+        the project's one pinch helper — with ``metric="l1"``, which reproduces the inline
+        ``abs(dx) + abs(dy) < click_threshold`` test exactly, so wiring the shared helper did not
+        change this path's feel. ``index_tip``/``thumb_tip`` remain in the signature for the
+        pre-Phase-1 API, but the metric works from the landmark sequence: pass ``landmarks`` if you
+        are calling this outside the frame loop (``process_landmarks`` leaves the frame's hand in
+        ``current_landmarks``).
+        """
         now = time.monotonic() if now is None else now
         fired = False
+        points = self.current_landmarks if landmarks is None else landmarks
 
-        pinch_active = abs(index_tip[0] - thumb_tip[0]) + abs(index_tip[1] - thumb_tip[1]) < self.config.click_threshold
+        pinch_active = is_pinch(points, threshold=self.config.click_threshold, metric="l1")
         if pinch_active and not self.last_pinch and (now - self.last_action_at) >= self.config.debounce_seconds:
             if self.can_emit:
                 self.output.click("left")
                 self.last_action_at = now
+                self._record_action("left click", now)
                 self.emitted += 1
                 fired = True
 
@@ -396,13 +456,19 @@ class HandMouseRuntime:
             if self.can_emit:
                 self.output.click("right")
                 self.last_action_at = now
+                self._record_action("right click", now)
                 self.emitted += 1
                 fired = True
         self.last_right_click = right_click
 
         return fired
 
-    def handle_scroll(self, index_tip: Tuple[float, float], hand_moving: bool = False) -> bool:
+    def handle_scroll(
+        self,
+        index_tip: Tuple[float, float],
+        hand_moving: bool = False,
+        now: Optional[float] = None,
+    ) -> bool:
         if self.last_index is None:
             self.last_index = index_tip
             return False
@@ -419,6 +485,7 @@ class HandMouseRuntime:
                 scroll_amount = int(delta_y * -900)
                 if scroll_amount != 0:
                     self.output.scroll(scroll_amount)
+                    self._record_action("scroll", time.monotonic() if now is None else now)
                     self.emitted += 1
                     scrolled = True
 
@@ -439,28 +506,66 @@ class HandMouseRuntime:
         update = self.gesture.update(Observation(landmarks=landmarks, timestamp=now))
         self.gesture_state = update.state
         self.last_gesture_events = update.events
-        return self._apply_gesture_events(update)
+        return self._apply_gesture_events(update, now=now)
 
-    def _apply_gesture_events(self, update: GestureUpdate) -> int:
+    def _apply_gesture_events(self, update: GestureUpdate, now: Optional[float] = None) -> int:
         emitted = 0
+        stamp = time.monotonic() if now is None else float(now)
         for event in update.events:
             if not self.can_emit:
                 break
             if event.kind is EventKind.LEFT_CLICK:
                 self.output.click("left")
+                self._record_action("left click", stamp)
             elif event.kind is EventKind.RIGHT_CLICK:
                 self.output.click("right")
+                self._record_action("right click", stamp)
             elif event.kind is EventKind.SCROLL:
-                amount = int(event.value)
-                if amount == 0:
-                    continue
-                self.output.scroll(amount)
+                emitted += self.emit_scroll(event, stamp)
+                continue
+            elif event.kind is EventKind.SCROLL_END:
+                # The gesture is over: send whatever the scroll rate cap was still holding back, so
+                # capping the event rate can never leave part of the movement unscrolled.
+                emitted += self.send_scroll(self.scroll_limiter.flush(), stamp)
+                continue
             else:
-                # scroll_begin/scroll_end, tracking and pause events are state bookkeeping.
+                # scroll_begin, tracking and pause events are state bookkeeping.
                 continue
             self.emitted += 1
             emitted += 1
         return emitted
+
+    def emit_scroll(self, event: GestureEvent, now: Optional[float] = None) -> int:
+        """Send one SCROLL event on both wheel axes, through the scroll rate limiter.
+
+        Phase 7: the recogniser reports the vertical amount in ``event.value`` and the horizontal one
+        in ``event.secondary``; both are emitted here (a zero axis is skipped, which is what the
+        pre-Phase-7 runtime did with the horizontal component and what
+        ``scroll_horizontal_gain = 0`` brings back). Amounts go out as *floats* so the limiter can keep
+        the sub-unit remainder — truncating each event to an int cost ~25% of the scroll distance on a
+        measured sweep. The limiter *accumulates* what it holds back, so capping the event rate never
+        loses distance either. Returns the number of adapter calls made.
+        """
+        stamp = time.monotonic() if now is None else float(now)
+        return self.send_scroll(self.scroll_limiter.add(event.value, event.secondary, stamp), stamp)
+
+    def send_scroll(self, amounts: Optional[Tuple[int, int]], now: float) -> int:
+        """Put an (vertical, horizontal) pair of scroll units on the adapter. Returns calls made."""
+        if amounts is None:
+            return 0
+
+        vertical, horizontal = amounts
+        calls = 0
+        if vertical:
+            self.output.scroll(vertical)
+            calls += 1
+        if horizontal:
+            self.output.hscroll(horizontal)
+            calls += 1
+        if calls:
+            self._record_action("scroll", now)
+            self.emitted += calls
+        return calls
 
     def process_landmarks(self, landmarks, now: Optional[float] = None) -> int:
         """Drive the cursor/click/scroll path from one frame's landmarks.
@@ -497,7 +602,7 @@ class HandMouseRuntime:
             emitted += self.apply_gestures(landmarks, now=now)
         else:
             emitted += int(self.handle_clicks(index_tip, thumb_tip, now=now))
-            emitted += int(self.handle_scroll(index_tip, hand_moving=hand_moved))
+            emitted += int(self.handle_scroll(index_tip, hand_moving=hand_moved, now=now))
         return emitted
 
     def process_frame(self, frame: np.ndarray, now: Optional[float] = None) -> int:
@@ -518,6 +623,8 @@ class HandMouseRuntime:
             self.last_index = None
             self.last_pointer_ref = None  # re-anchor on reacquire: the cursor must not jump
             self.cursor_filter.reset()  # Phase 3: drop smoothing state so nothing glides in
+            self.move_limiter.reset()  # Phase 5: the reacquired hand's first move passes through
+            self.scroll_limiter.reset()  # Phase 7: and its first scroll, whose remainder is over
             self.last_pinch = False
             self.last_right_click = False
             emitted = 0
@@ -532,15 +639,22 @@ class HandMouseRuntime:
     # -- preview --------------------------------------------------------------
 
     def draw_preview(self, frame: np.ndarray, camera: Optional[Any] = None) -> np.ndarray:
-        preview = frame
+        """Compose the overlay and return the frame in the orientation the config asks for.
+
+        The two halves have to agree or the skeleton is drawn reflected beside the hand: the landmarks
+        come from the mirrored frame MediaPipe was fed, so the display orientation decides whether they
+        are mirrored again (see :mod:`kinematic.preview`). Text is drawn *after* the flip, so the
+        readout is never mirrored.
+        """
+        preview = display_frame(frame, self.config.preview_flip)
         if self.config.preview_scale != 1.0:
-            preview = cv2.resize(frame, None, fx=self.config.preview_scale, fy=self.config.preview_scale)
+            preview = cv2.resize(preview, None, fx=self.config.preview_scale, fy=self.config.preview_scale)
         elif self.config.show_fps or self.config.show_landmarks or self.paused:
-            preview = frame.copy()
+            preview = preview.copy()
 
         if self.config.show_landmarks:
             # Drawn on the preview (scaled or not) so the overlay scales with the window.
-            draw_hands(preview, self.current_hands)
+            draw_hands(preview, self.current_hands, flip=landmark_flip(self.config.preview_flip))
 
         y = 22
         if self.config.show_fps:
@@ -575,11 +689,33 @@ class HandMouseRuntime:
             )
             y += 24
 
+        show_last_action = self.config.show_last_action and self.last_action is not None
+        if show_last_action:
+            # Phase 6: what actually reached the desktop (or, under --dry-run, what would have) —
+            # the readout the manual click verification procedure uses. It appears once the first
+            # click/scroll has fired, so a freshly started session draws nothing extra.
+            cv2.putText(
+                preview,
+                self.last_action_text(),
+                (8, y),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.55,
+                (80, 255, 255),
+                1,
+                cv2.LINE_AA,
+            )
+            y += 24
+
         if self.paused:
             cv2.putText(
                 preview,
                 "PAUSED - press SPACE to control the mouse",
-                (8, y if (self.config.show_fps or self.config.show_sensitivity) else 22),
+                (
+                    8,
+                    y
+                    if (self.config.show_fps or self.config.show_sensitivity or show_last_action)
+                    else 22,
+                ),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.55,
                 (0, 165, 255),
@@ -663,6 +799,18 @@ class HandMouseRuntime:
             "sensitivity": round(self.sensitivity, 4),
             "sensitivity_start": round(self.sensitivity_start, 4),
             "sensitivity_changes": self.sensitivity_changes,
+            # Phase 5/6: what the output path actually did, so a run can be checked without the
+            # desktop: the action counts, the last one, and how many moves the limiter thinned.
+            "last_action": self.last_action,
+            "actions": self.actions(),
+            "move_max_hz": self.move_limiter.max_hz,
+            "moves_suppressed": self.move_limiter.suppressed,
+            # Phase 7: the scroll path's own knobs, so a run can be checked without the desktop.
+            "scroll_max_hz": self.scroll_limiter.max_hz,
+            "scrolls_held": self.scroll_limiter.suppressed,
+            "scroll_horizontal_gain": self.config.scroll_horizontal_gain,
+            "scroll_invert_vertical": self.config.scroll_invert_vertical,
+            "scroll_invert_horizontal": self.config.scroll_invert_horizontal,
         }
 
     def close(self) -> None:

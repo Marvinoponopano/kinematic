@@ -42,6 +42,7 @@ kinematic/
 │   ├── mapping.py         # Region + map_point_to_screen (frame region -> screen region)
 │   ├── output.py          # MouseOutput adapters: RealMouseOutput / RecordingMouseOutput (mock)
 │   ├── preview.py         # landmark skeleton drawing for the debug preview (drawn with cv2, no protobuf)
+│   ├── ratelimit.py       # Phase 5: MoveRateLimiter — cap/coalesce cursor moves (off by default)
 │   ├── recognizer.py      # Phase 4: the pure gesture state machine (states, relative thresholds,
 │   │                      #   hysteresis, hold/cooldown/re-arm, scroll priority, event list)
 │   ├── runtime.py         # HandMouseRuntime: pipeline coordinator + the pause gate on all output
@@ -56,15 +57,23 @@ kinematic/
     ├── test_phase3_smoothing.py  # 21 cases: EMA + 1-euro behaviour, jitter, latency, reset
     ├── test_phase4_recognizer.py # 54 cases: transitions, hysteresis, hold/cooldown/re-arm, priority, scroll
     ├── test_phase4_runtime.py    # 18 cases: the recogniser wired in, the pause gate, the legacy engine
+    ├── test_phase6_clicks.py     # 32 cases: exact click counts per tap, cooldown/re-arm, suppression,
+    │                            #   the last-action readout, the shared is_pinch() helper
+    ├── test_move_rate_limit.py   # 25 cases: the limiter itself, its wiring, the measured trade-off
+    ├── test_phase7_scroll.py     # 42 cases: per-axis dead zone, signs/gains, inversion, both wheel
+    │                            #   axes through the adapter, rate cap fidelity, the sweep harness
+    ├── test_preview_orientation.py # 18 cases: the preview flip modes and the skeleton landing on the hand
     ├── test_sensitivity_dial.py  # 38 cases: the pointer-gain dial, its keys, its bar, its wiring
     ├── test_pointer_modes.py     # 21 cases: absolute is the default, every edge reachable, the reach floor
     └── test_pointer_reference.py # 21 cases: wrist/palm reference, curl must not move the cursor, scroll guard
 tools/
 ├── compare_smoothing.py         # seeded jitter-vs-lag comparison of the cursor filters
 ├── gesture_trace.py             # scripted poses through the recogniser: transition table, no camera
-├── measure_loop.py              # measure the loop rate with the mouse intercepted (nothing moves)
+├── measure_loop.py              # measure the loop rate with the mouse intercepted (nothing moves),
+│                                #   count clicks per synthetic tap, --move-max-hz / --mouse-pause
 ├── measure_stability.py         # per-frame wrist/palm jitter vs pointer_deadzone (no output adapter at all)
-└── measure_smoothness.py        # held frames / step size / trailing of the emitted cursor (no camera, no mouse)
+└── measure_smoothness.py        # held frames / step size / trailing of the emitted cursor (no camera, no mouse),
+                                 #   plus --rate-sweep for the move_max_hz trade-off
 ```
 
 Git: published as a private repo, `origin` = `github.com/Marvinoponopano/kinematic`, branch `main`.
@@ -95,6 +104,12 @@ python3 tools/measure_stability.py --seconds 15          # tune pointer_deadzone
 python3 tools/measure_smoothness.py                      # held frames / step size / trailing, no camera at all
 python3 tools/measure_smoothness.py --sweep               # the deadzone x filter grid this tuning came from
 python3 tools/measure_smoothness.py --min-cutoff 2 --one-euro-beta 8   # feel the trade-offs yourself
+python3 tools/measure_smoothness.py --rate-sweep        # what a move_max_hz cap costs (held frames, step size)
+python3 tools/measure_loop.py --synthetic-hand --active --frames 150   # clicks per synthetic tap, counted
+python3 tools/measure_loop.py --synthetic-hand --active --mouse-pause 0.1 --move-max-hz 3  # the slow-adapter case
+python3 tools/measure_loop.py --synthetic-hand --active --synthetic-scroll vertical --frames 150   # scroll direction
+python3 tools/measure_loop.py --synthetic-hand --active --synthetic-scroll diagonal --scroll-max-hz 4  # the cap, accumulating
+python3 -m kinematic.main --preview-flip none          # preview exactly as the camera delivers it (default: horizontal)
 ```
 
 ### Verified interpreter / dependency facts
@@ -144,9 +159,10 @@ Also present but not used by this project: Homebrew `python3.13` / `python3.14`,
   landmarks; MediaPipe's own output, the real camera path and the click/scroll branches are not
   asserted in the suite (they are exercised manually).
 - **No packaging** (no `pyproject.toml`) and no logging.
-- **One duplicated helper:** `gesture.is_pinch()` is exported and tested but unused by the pipeline,
-  which still computes pinch inline with an L1 metric (Phase 6 owns the switch). `gesture.clamp()` is now
-  used — by `clamp_point()` and the pointer target clamp.
+- **One duplicated helper, resolved in Phase 6:** `gesture.is_pinch()` used to be exported and tested but
+  unused by the pipeline, which computed its pinch inline. The default engine works from hand-scale
+  relative ratios, and the *legacy* engine now calls `is_pinch(..., metric="l1")` — the one helper, with
+  the prototype's metric as an explicit argument rather than a second copy of the arithmetic.
 
 ### Landmarks and preview (Phase 2, finished 2026-10-10)
 
@@ -164,6 +180,17 @@ at the boundary, in `landmarks.hands_from_results()`:
   an incomplete hand draws nothing. `show_landmarks` (default on) switches it off.
 
 Nothing else in the package imports protobuf-shaped objects or MediaPipe drawing utils now.
+
+**Preview orientation (fixed 2026-10-11).** `process_frame` flips the captured frame before detection
+(`cv2.flip(frame, 1)`), so every landmark the preview draws is in *mirrored* coordinates — but
+`draw_preview` was handed the captured frame, which drew the skeleton reflected beside the hand, and the
+footage itself was the raw camera view while the pointer follows the mirrored one. `preview.py` now owns
+both halves of the rule: `display_frame(frame, mode)` picks the orientation shown and
+`landmark_flip(mode)` the mirror the landmarks need, with `HandMouseConfig.preview_flip`
+(`--preview-flip`, default `"horizontal"` = the webcam mirror). All four modes keep the skeleton on the
+hand; the readout text is drawn *after* the flip so it is never mirrored; the 18 cases in
+`tests/test_preview_orientation.py` pin each mode with a marker-block hand at a known asymmetric world
+position (skeleton centroid within ~3 px of the marker, and >100 px off if the display flip is removed).
 
 ### Smoothing and screen mapping (Phase 3, finished 2026-10-10)
 
@@ -225,7 +252,9 @@ synthetic hand, no camera, no mouse; `still` / `slow` / `fast` are straight palm
    `deadzone=0.0` is now the default, a non-zero value is a **radius** rather than a per-axis box (a box
    pins slow *diagonal* movement to the grid), and jitter is left to the filter, which smooths
    continuously instead of in steps. Non-zero is still available and measured — `0.02` now costs 20 held
-   frames, 31 px jumps, CV 1.04 and **+39 px of trailing** on the slow path.
+   frames, 31 px jumps, CV 1.04 and **+15.5 px of trailing** on the slow path (measured 2026-10-11;
+   the earlier "+39 px" came from sampling the ideal path by move index, which mixed the sample spacing
+   into the number — `measure_smoothness.py` now samples it on the frame each move was emitted on).
 2. **The One Euro filter was effectively switched off.** `beta` is a *pixel-unit* parameter (the paper's
    default is 0.007 for pixel coordinates), but the filter is fed screen-pixel positions whose per-frame
    deltas are 1-30 — so `beta=8.0` gave `alpha≈0.96` even at 0.5 px/frame, passing landmark noise and
@@ -476,6 +505,144 @@ width — is pinned by tests in `tests/test_sensitivity_dial.py`
 (`test_travel_matches_the_documented_units`, `test_double_the_gain_doubles_the_travel`,
 `test_turning_the_dial_mid_motion_does_not_rescale_what_is_already_on_screen`).
 
+### Clicks through the recording adapter (Phase 6, finished 2026-10-11)
+
+Phase 6's own verification bar — "use the recording adapter to confirm exact click counts, cooldown
+behaviour, gesture distinction, and suppression rules" — is met by `tests/test_phase6_clicks.py` (32
+cases) and by the loop harness. What the phase added on top of Phase 4's recogniser:
+
+* **Last-action status** (`show_last_action`, on by default). The runtime records every click/scroll it
+  *emits* (`last_action`, `action_counts`, and `summary()["actions"]`) and the preview draws
+  `last: left click  0.3s ago  (4 this session)` on the line below the sensitivity dial. It appears once
+  the first action has fired, so a fresh session draws nothing extra (which is also why the older
+  preview tests still pass unchanged). Because it counts *emitted* actions, it works under `--dry-run` as
+  the readout for "what would have been sent" — that is what the manual click verification procedure in
+  the README is built on.
+* **The duplicated pinch test is gone.** `runtime.handle_clicks()` (the legacy engine) used to compute
+  `abs(dx) + abs(dy) < click_threshold` inline; it now calls `gesture.is_pinch(..., metric="l1")`. The
+  metric is an explicit argument (`PINCH_METRICS = ("euclidean", "l1")`) instead of an accident of where
+  the test was written, so the legacy path's feel is byte-identical (a test compares the helper against
+  the old expression over a grid of tip offsets) and the recogniser keeps its own relative, hand-scale
+  thresholds — a test asserts the recogniser never calls the absolute helper at all.
+* The runtime also sets `last_action_at` on the recogniser path, which is the field the legacy debounce
+  reads; the two engines never share a runtime, so this is bookkeeping only.
+
+**Evidence — the real loop, real camera, real MediaPipe, mouse calls intercepted and counted**
+(`--synthetic-hand --active --synthetic-pinch <pose> --frames 150`; the synthetic hand taps for 6 frames
+of every 30, so 5 deliberate taps):
+
+| Engine | Pose | moves | clicks | scrolls | Tool verdict |
+| --- | --- | --- | --- | --- | --- |
+| `recognizer` (default) | left pinch | 150 | **5** | 0 | `pass - one click per deliberate tap (5 clicks for 5 taps)` |
+| `recognizer` | right pinch | 150 | **5** | 0 | the same, last action `right click` |
+| `recognizer` | two-finger | 150 | **0** | **5** | `pass - the scroll pose scrolls and never clicks` |
+| `legacy` | left pinch | 150 | 6 | 0 | one *or two* clicks per tap: its left and right tests can both fire |
+| `legacy` | two-finger | 150 | 6 | **0** | documented pre-Phase-4 behaviour: it clicks instead of scrolling |
+
+Exact one-to-one counts under the recogniser; the legacy column is the reason it is not the default. The
+verdict line is printed by `tools/measure_loop.py` itself (taps offered vs clicks recorded), so the
+procedure is checkable at a glance rather than by eye.
+
+### Cursor move rate limit (Phase 5's last bullet, finished 2026-10-11)
+
+`kinematic/ratelimit.py` holds `MoveRateLimiter`: a pure, timestamp-driven cap on how often a cursor move
+may be emitted. `move_max_hz` is the config field (CLI `--move-max-hz`), and it is **0 — off — by
+default**, because that is what the measurements say:
+
+| `move_max_hz` | moves / 90 frames | mean step | held frames | trailing |
+| --- | --- | --- | --- | --- |
+| 0 (default) | 90 | 6.2 px | 0 | 7.1 px |
+| 30 (the loop rate) | 90 | 6.2 px | 0 | 7.1 px |
+| 20 / 15 | 45 | 12.4 px | 45 | 7.2 px |
+| 10 | 30 | 18.7 px | 60 | 7.2 px |
+| 5 | 15 | 36.7 px | 75 | 7.2 px |
+
+(`tools/measure_smoothness.py --rate-sweep`, seeded hand, slow path, no camera. Note 20 and 15 are the
+same row: on a 30 fps loop the effective rate quantises to divisors of the frame rate, so a 20 Hz cap is
+really 15 Hz.)
+
+Two conclusions from it, both pinned by `tests/test_move_rate_limit.py` (25 cases):
+
+1. **At the default settings it is not needed.** The loop is camera-bound at ~30 fps and a move costs
+   ~11 ms, so one move per frame already happens; a cap at the frame rate is *identical* to uncapped
+   (same 90 moves, same mean step) and anything lower just makes the steps bigger — the hold-then-jump
+   the smoothness work removed. This is why the answer to "if needed" is "off", not "always on".
+2. **It is needed when the output adapter is slow.** With `--mouse-pause 0.1` (pyautogui's own default,
+   ~113 ms per move, longer than the 33 ms frame interval) the loop blocks on the mouse and collapses:
+
+   | Command (real camera, mouse intercepted) | moves | loop rate |
+   | --- | --- | --- |
+   | `--frames 150` | 150 | **29.7 fps** |
+   | `--frames 150 --move-max-hz 10` | 47 | 30.0 fps (nothing to fix) |
+   | `--frames 120 --mouse-pause 0.1` | 120 | 6.8 fps |
+   | `--frames 120 --mouse-pause 0.1 --move-max-hz 5` | 32 | **17.4 fps** |
+   | `--frames 120 --mouse-pause 0.1 --move-max-hz 3` | 15 | **22.9 fps** |
+
+   Note the 8 Hz row that is *missing* from the table: a cap **above** the rate the adapter can sustain
+   changes nothing (measured 6.76 fps with `--mouse-pause 0.1 --move-max-hz 8` versus 6.78 fps uncapped),
+   because the loop is already slower than the cap. A rate limit is only useful below the achieved rate.
+
+Two properties the class is built around, each with a test: **nothing is queued** (a frame inside the
+interval emits nothing and is superseded by the next due frame — a 20-frame burst produces one move, not
+a backlog) and **no clock of its own** (timestamps are arguments, like the filters and the recogniser).
+It runs *after* the `min_move_pixels` guard in `_move_towards()`, applies to cursor moves only (never to
+clicks or scrolls), and is reset with the cursor filter when tracking is lost so a short dropout cannot
+hold back the reacquired hand's first move. `summary()` reports `move_max_hz` and `moves_suppressed`.
+
+### Two-finger scrolling on both axes (Phase 7, finished 2026-10-11)
+
+The two-finger pose already existed (Phase 4); Phase 7 finished the path it feeds. What changed:
+
+1. **The horizontal component is emitted.** `GestureEvent.secondary` used to be computed and dropped;
+   `runtime.emit_scroll()` now puts it on `output.hscroll()` while the vertical amount goes to
+   `output.scroll()`. The two are separate adapter methods because they reach different wheel axes in
+   the OS event, and `MouseEvent.axis` records which one a call used — `counts()` still counts both
+   under `"scroll"`, so every earlier `counts() == {...}` assertion still holds.
+   `scroll_horizontal_gain = 0` (CLI `--no-horizontal-scroll`) restores the pre-Phase-7 behaviour
+   exactly, which is the switch for anyone who does not want sideways scrolling.
+2. **The dead zone became per axis.** Before, one axis over the zone meant both were sent; with
+   horizontal scrolling live that would put every sideways wobble on the screen as sideways scrolling.
+   Now the axis under the zone is dropped and the other still goes (a test pins a vertical scroll with
+   a sub-dead-zone horizontal drift producing zero `hscroll` calls). Both axes under the zone still
+   hold the reference and accumulate, as before.
+3. **Per-axis direction inversion** (`scroll_invert_vertical`, `scroll_invert_horizontal`) and a
+   separate horizontal gain, applied in `GestureRecognizer._axis_amount()` — the pure module is where
+   a hand movement becomes a scroll amount, so the switches live there rather than in the adapter.
+   The gains must be non-negative (a `ValueError` otherwise): the sign is the inversion field's job.
+4. **The event rate can be capped** (`scroll_max_hz`), and the cap **accumulates** instead of dropping:
+   scroll amounts are deltas, so a held frame is added to the pending total and sent on the next due
+   frame (see `ScrollRateLimiter` and the decision in §6). At the end of the gesture the remainder is
+   flushed (`scroll_end`), so capping the rate never leaves distance unscrolled.
+
+**A real bug this phase found and fixed:** every scroll amount used to be truncated to an `int` *per
+event*. With a slow hand each frame asks for a fraction of a wheel unit, and on a measured sweep that
+rounding ate **25% of the distance** (135 units emitted of the 180 the hand travelled). Amounts now go
+into the accumulator as floats and the sub-unit remainder carries over. That also fixed the pre-existing
+vertical path, which had the same silent loss.
+
+**Evidence — real loop, real camera, real MediaPipe, wheel calls intercepted and counted**
+(`--synthetic-hand --active --synthetic-scroll <axis> --frames 150 --scroll-frames 140`, a straight
+sweep from −0.10 to +0.10 frame widths, so the net hand movement is down/right):
+
+| Sweep | vertical events / units | horizontal events / units | Tool verdict |
+| --- | --- | --- | --- |
+| `vertical` | 45 / **−174** | 0 / 0 | `pass - hand down -> -174 vertical (page down), no sideways events` |
+| `horizontal` | 0 / 0 | 45 / **+174** | `pass - hand right -> +174 horizontal (scroll right), no vertical events` |
+| `diagonal` | 45 / **−174** | 45 / **+174** | `pass - hand down-right -> -174 vertical, +174 horizontal` |
+| `diagonal --scroll-max-hz 10` | 32 / −174 | 32 / +174 | 13 frames held and accumulated — same distance, fewer events |
+| `diagonal --scroll-max-hz 4` | 15 / −167 | 15 / +167 | 30 frames held; the last interval was still pending when the run ended |
+| `diagonal --no-horizontal-scroll` | 45 / −174 | **0 / 0** | the pre-Phase-7 switch |
+| `vertical --invert-scroll-vertical` | 45 / **+174** | 0 / 0 | the tool's verdict prints `CHECK` — correct: it expects the default direction, and this run deliberately inverted it |
+
+0 clicks in every run (the scroll pose never clicks), and the loop rate is unchanged at ~30 fps.
+
+**What this project genuinely cannot verify here, stated plainly:** which way *content* moves for a
+positive macOS horizontal wheel value. pyautogui's `hscroll` (whose docstring says horizontal scrolling
+is "currently just Linux" — stale: `_pyautogui_osx._hscroll` posts a 2-axis `CGEventCreateScrollWheelEvent`)
+takes the sign from Quartz, and finding out what an app does with it would mean scrolling the user's
+screen. So the convention is documented (hand right → positive) and `scroll_invert_horizontal` is the
+one-field fix; the README's manual test says to check it and flip that field if it feels backwards.
+
 ### Phase status — which phases are actually implemented (audited 2026-10-10)
 
 **Phases 1, 2, 3 and 4 are complete (5/5 each).** Before Phase 1 this repo was a prototype that drove
@@ -496,25 +663,28 @@ updated since.
 | 1 — Foundation & safety | ✅ **5/5 (2026-10-10)** | Modules split: `capture.py`, `gesture.py`, `output.py` (adapters), `runtime.py` (coordinator), `main.py` (CLI); `requirements.txt`; 256-test suite; **paused startup** with SPACE toggle and ESC/q quit; **`RecordingMouseOutput` mock adapter** used by tests and `--dry-run`; macOS permission docs in README | — |
 | 2 — Capture pipeline | ✅ **5/5 (2026-10-10)** | `capture.py`'s threaded `ThreadedCamera` (`isOpened()` error, buffer size, device-error reporting); `cv2.flip` mirroring, BGR→RGB, `mp.solutions.hands`, invalid-frame error, exception-safe teardown (the runtime's `try/finally`); **`landmarks.py`** (Landmark/HandLandmarks, the single protobuf conversion point, incomplete detections flagged); **preview overlay** of the loop rate *and* the 21-point skeleton (`preview.py`, drawn with cv2, `show_landmarks`) | — |
 | 3 — Geometry/mapping/smoothing | ✅ **5/5 (2026-10-10)** | `gesture.py`: distances, `midpoint`/`midpoints`, `pinch_distances`, `hand_scale` + `hand_span`, `clamp`/`clamp_point`, `mirror_point`, EMA; `mapping.py`: `Region` + `map_point_to_screen` (frame region → screen region, clamping, mirroring); `smoothing.py`: EMA + 1-euro filters with `reset()`, wired into the runtime with a tracking-loss reset; 44 deterministic tests for distances, clamping, smoothing, latency and reset | Midpoints are available but not yet *used* by a gesture; One Euro parameters are tuned for this camera rather than for everyone |
-| 4 — Gesture state machine | ✅ **5/5 (2026-10-10)** | `recognizer.py`: `HandState` (neutral / left pinch / right pinch / two-finger scroll / paused / tracking-lost), `EventKind` + `GestureEvent`, `GestureThresholds`/`Observation`/`GestureUpdate`, `GESTURE_PRIORITY`; thumb–index vs thumb–middle pinch detection from `pinch_distances()` ÷ `hand_scale`; per-pair hysteresis, hold time, cooldown, re-arm (`reset(disarm=True)`), scroll-priority resolution, "no switch without neutral", scroll reference/dead-zone/gain; wired into the runtime via `apply_gestures()` behind `can_emit`, with the paused/tracking states driven by the pause key and the frame loop; 72 new tests (54 recogniser + 18 runtime) | The thresholds are reasoned defaults, not measured against a real hand (Phase 9 owns calibration); horizontal scroll is computed and reported (`GestureEvent.secondary`) but not yet emitted |
-| 5 — Cursor movement | 🟡 **4/5 (2026-10-10)** | **Absolute position mapping is now the default scheme** (`pointer_mode="absolute"`, inner 70% of the frame → whole screen) with the dial scales its reach, so every screen edge and corner is directly reachable — measured, see §2 "Reach and the sensitivity floor"; palm/wrist-relative pipeline still available and tested; smoothing, clamp and `min_move_pixels`; **dry-run and real adapters**; **opt-in gate** (starts paused, `--dry-run`); paused/bounds suppression; the explicit *tracking-lost* state (`HandState.TRACKING_LOST`, emitted once per loss, filter and anchor reset) | A real rate limit/coalescer (the last bullet) |
-| 6 — Left & right clicks | 🟡 **3/5 + 1 partial** | Left click, right click (thumb–middle), shared cooldown, release-then-re-arm, **scroll precedence** and last-action suppression — all in the recogniser, whose 72 tests assert exact click counts; **suppressed while paused** (Phase 1's `can_emit` gate and the recogniser's own `PAUSED` state, including a pinch held across a resume); the legacy inline path (L1 pinch test, `is_right_click_gesture`) is still reachable via `--gesture-engine legacy` | Last-action status on the preview (hovering a click's target is not tracked); the legacy path still re-implements the pinch inline |
-| 7 — Two-finger scroll | 🟡 **3/5 + 1 partial** | Two-finger (index+middle) pose with the midpoint as reference, reference reset on entry, dead zone, configurable `scroll_gain` (900) and direction (negative = page down), **click suppression while scrolling** (the pose scrolls instead of clicking); horizontal component computed and reported | Emitting the horizontal component, direction inversion as a config field, and rate limiting; the *legacy* index-finger scroll path is unchanged (and still non-conforming) |
+| 4 — Gesture state machine | ✅ **5/5 (2026-10-10)** | `recognizer.py`: `HandState` (neutral / left pinch / right pinch / two-finger scroll / paused / tracking-lost), `EventKind` + `GestureEvent`, `GestureThresholds`/`Observation`/`GestureUpdate`, `GESTURE_PRIORITY`; thumb–index vs thumb–middle pinch detection from `pinch_distances()` ÷ `hand_scale`; per-pair hysteresis, hold time, cooldown, re-arm (`reset(disarm=True)`), scroll-priority resolution, "no switch without neutral", scroll reference/dead-zone/gain; wired into the runtime via `apply_gestures()` behind `can_emit`, with the paused/tracking states driven by the pause key and the frame loop; 72 new tests (54 recogniser + 18 runtime) | The thresholds are reasoned defaults, not measured against a real hand (Phase 9 owns calibration) — **Phase 7 has since emitted the horizontal component** (`GestureEvent.secondary`), which this row listed as missing when it was written |
+| 5 — Cursor movement | ✅ **5/5 (2026-10-11)** | **Absolute position mapping is now the default scheme** (`pointer_mode="absolute"`, inner 70% of the frame → whole screen) with the dial scales its reach, so every screen edge and corner is directly reachable — measured, see §2 "Reach and the sensitivity floor"; palm/wrist-relative pipeline still available and tested; smoothing, clamp and `min_move_pixels`; **dry-run and real adapters**; **opt-in gate** (starts paused, `--dry-run`); paused/bounds suppression; the explicit *tracking-lost* state (`HandState.TRACKING_LOST`, emitted once per loss, filter and anchor reset); **`ratelimit.py`'s `MoveRateLimiter`** — the last bullet: a pure, timestamp-driven cap that coalesces (never queues) cursor moves, reported by `summary()["moves_suppressed"]`, off by default because the measurement says it is only needed when the adapter is slow (25 new tests, `--rate-sweep`, `--mouse-pause`) | — |
+| 6 — Left & right clicks | ✅ **5/5 (2026-10-11)** | Left click, right click (thumb–middle), shared cooldown, release-then-re-arm, **scroll precedence** — all in the recogniser, whose 72 tests assert exact click counts and whose 32 new recording-adapter tests (`test_phase6_clicks.py`) pin the counts per tap, the cooldown drop, re-arm, pause/tracking-loss suppression and the HUD readout; **suppressed while paused** (Phase 1's `can_emit` gate and the recogniser's own `PAUSED` state, including a pinch held across a resume); **last-action status** on the preview (`show_last_action`, `last_action`, `summary()["actions"]`), which doubles as the readout for the manual click verification procedure in the README; the legacy path is still reachable via `--gesture-engine legacy` and now uses the shared `gesture.is_pinch(..., metric="l1")` instead of a second inline copy of the metric; measured in the real loop: 5 clicks / 5 taps left, 5 right, 0 clicks + 5 scrolls for the two-finger pose | Hovering a click's target is still not tracked (the phase's optional extra); the legacy engine's one-or-two-clicks-per-tap behaviour is unchanged by design |
+| 7 — Two-finger scroll | ✅ **5/5 (2026-10-11)** | Two-finger (index+middle) pose with the midpoint as reference, reference reset on entry, **per-axis dead zone**, configurable `scroll_gain` (vertical) and `scroll_horizontal_gain` (horizontal, `0` = the pre-Phase-7 behaviour of dropping the sideways component), `scroll_invert_vertical`/`scroll_invert_horizontal`, **both wheel axes emitted** (`output.scroll` + `output.hscroll`, distinguished by `MouseEvent.axis`), **click suppression while scrolling** (the pose scrolls instead of clicking), and a `scroll_max_hz` cap that **accumulates** held frames instead of dropping them → distance preserved; measured in the real loop: a vertical sweep −174 units with 0 sideways events, horizontal +174 with 0 vertical, diagonal both, 0 clicks; 42 new tests | The *content* direction of a positive macOS horizontal wheel value is inherited from Quartz and is not verifiable without scrolling the user's screen — hence `scroll_invert_horizontal`; the **legacy** index-finger scroll path is unchanged (still non-conforming: it never had hold/hysteresis or the two-finger reference) |
 | 8 — Pause/runtime/feedback | 🟡 **4/5 + 1 partial** | `runtime.py` coordinator; configurable keyboard toggle (`toggle_pause_keys`) with paused startup; PAUSED/ACTIVE **and the live gesture state** on the preview (`f"… fps  {gesture_state}"`); the recogniser's `PAUSED`/`TRACKING_LOST` states, kept in step by `_sync_gesture_pause()` and the no-hand branch; exception-safe teardown (`try/finally`) | The optional *gesture* pause, and tests for toggle idempotence, recovery and window-close cleanup |
-| 9 — Calibration/hardening | ⛔ **0/5 + 1 partial** | `HandMouseConfig` with the tunables this phase asks for — camera, margins, smoothing, pinch thresholds, cooldown, hotkeys (`toggle_pause_keys`/`quit_keys`/the dial's key tuples) and sensitivity, now adjustable at **runtime** via the dial (`set_sensitivity`/`adjust_sensitivity`, `]`/`[`/`0`, `--sensitivity`, `--sensitivity-step`) | Mirroring as a config field, diagnostics, logging (0 hits), profiling, packaging (`pyproject.toml`), final setup docs, and the settings-do-not-persist gap: the dial's value is per-session (pass `--sensitivity` to pin it) |
-| Tests | 256 passing | gesture helpers; config defaults; cursor-move guard; camera error path; the Phase 1 safety suite; the pointer-reference suite (curl must not move the cursor, gain/clamp/deadzone maths, re-anchor, scroll guard — pinned to `pointer_mode="relative"`); the landmark suite; the Phase 3 geometry and smoothing suites; the Phase 4 recogniser suite (54 cases) and runtime suite (18 cases); the sensitivity-dial suite (38 cases); the pointer-modes suite (21 cases: absolute is the default, the frame region's corners reach the screen's corners, landmarks outside it clamp, curl does not move the cursor in absolute mode, the floor clamps the dial *and* a `--sensitivity` below it, and lowering the floor by hand reproduces the unreachable-edge bug); the smoothness suite (15 cases: a still hand's steps stay under 4 px, `beta=8` is measurably worse than `beta=0`, a slow sweep never holds a frame, the old deadzone reproduces the holding/jumping, the guard stops sub-threshold moves) | MediaPipe's own detections, the real camera path, and the legacy click/scroll branches beyond the pinned cases |
+| 9 — Calibration/hardening | ⛔ **0/5 + 1 partial** | `HandMouseConfig` with the tunables this phase asks for — camera, margins, smoothing, pinch thresholds, cooldown, hotkeys (`toggle_pause_keys`/`quit_keys`/the dial's key tuples) and sensitivity, now adjustable at **runtime** via the dial (`set_sensitivity`/`adjust_sensitivity`, `]`/`[`/`0`, `--sensitivity`, `--sensitivity-step`); **mirroring is a config field now** (`preview_flip` / `--preview-flip`, 2026-10-11) | Diagnostics, logging (0 hits), profiling, packaging (`pyproject.toml`), final setup docs, and the settings-do-not-persist gap: the dial's value is per-session (pass `--sensitivity` to pin it) |
+| Tests | 373 passing | gesture helpers; config defaults; cursor-move guard; camera error path; the Phase 1 safety suite; the pointer-reference suite; the landmark suite; the Phase 3 geometry and smoothing suites; the Phase 4 recogniser suite (54 cases) and runtime suite (18 cases); the Phase 6 click suite (32 cases); the move-rate-limit suite (25 cases); the Phase 7 scroll suite (42 cases: per-axis dead zone, both axes through the recording adapter, sign/gain/inversion maths, the accumulating rate cap, the sweep harness's verdict); the preview-orientation suite (18 cases: all four flip modes, and the skeleton landing on the hand in each); the sensitivity-dial suite (38 cases); the pointer-modes suite (21 cases); the smoothness suite (15 cases) | MediaPipe's own detections, the real camera path, the legacy click/scroll branches beyond the pinned cases, and the on-screen *direction* of a horizontal wheel event |
 
 **What this means for the next session:**
 
-- **Phases 1–4 are done.** Capture, geometry, mapping, smoothing, the safety layer and the gesture
-  state machine are in place and tested, so every remaining phase can be built on a pipeline that
-  cannot hurt the desktop and does not need a camera in the test suite.
+- **Phases 1–7 are done.** Capture, geometry, mapping, smoothing, the safety layer, the gesture
+  state machine, the click path and both scroll axes are in place and tested, so every remaining phase
+  can be built on a pipeline that cannot hurt the desktop and does not need a camera in the test suite.
 - **The control scheme is absolute position by default** (changed 2026-10-10) with the sensitivity dial
   scaling its reach and floored at gain 1.0 so the screen stays reachable; `--pointer-mode relative`
   restores the displacement-based scheme. Read §2 "Pointer reference and control scheme" and "Reach and
   the sensitivity floor" before touching either — the reachability requirement is the reason for both.
-- **Phase 5 is one bullet from done**: a real rate limit/coalescer for cursor moves. Everything else in
-  its list is implemented and tested.
+- **Phase 5, Phase 6 and Phase 7 are closed** (2026-10-11): the rate limiter is in `ratelimit.py` (move
+  caps supersede, scroll caps accumulate), the click path has its recording-adapter suite plus the
+  last-action readout, and the scroll path emits both wheel axes with per-axis dead zone, inversion and
+  an accumulating event cap. Read §2 "Cursor move rate limit", "Clicks through the recording adapter" and
+  "Two-finger scrolling on both axes" before touching the move, click or scroll paths.
 - **Retrofit, don't rewrite.** Every phase so far added a module and switched the runtime over while
   leaving the previous path reachable (EMA next to One Euro, index next to palm, absolute next to
   relative, `legacy` next to `recognizer`). Keep doing that: it is what makes the changes reviewable
@@ -752,19 +922,29 @@ repeated pinches, ambiguous input, tracking loss, and simultaneous gestures.
 
 ### Phase 5 — Cursor movement
 
-**Status: 🟡 4/5 (updated 2026-10-10).** Four of the five bullets are done, and the mapping the phase
-asked to calibrate is now the **default scheme**: absolute position mapping (the inner 70% of the frame →
-the whole screen) with the sensitivity dial scaling its reach, so every screen edge and corner is
-directly reachable — measured with `tools/measure_loop.py --sweep-reach` (all four edges at gains 1.0, 3.0
-and 8.0). Also in place: the dry-run and real cursor adapters, cursor output behind the `can_emit` gate
-(the app starts paused), moves below `min_move_pixels` skipped, bounds clamping, and the explicit
-tracking-lost suppression (`HandState.TRACKING_LOST`, with the filter and anchor reset). What remains is a
-genuine rate limit/coalescer.
+**Status: ✅ 5/5 complete (2026-10-11).** All five bullets are done, and the mapping the phase asked to
+calibrate is now the **default scheme**: absolute position mapping (the inner 70% of the frame → the
+whole screen) with the sensitivity dial scaling its reach, so every screen edge and corner is directly
+reachable — measured with `tools/measure_loop.py --sweep-reach` (all four edges at gains 1.0, 3.0 and
+8.0). Also in place: the dry-run and real cursor adapters, cursor output behind the `can_emit` gate (the
+app starts paused), moves below `min_move_pixels` skipped, bounds clamping, and the explicit
+tracking-lost suppression (`HandState.TRACKING_LOST`, with the filter and anchor reset).
+
+The last bullet — "rate-limit or coalesce movement events **if needed**" — landed as
+`kinematic/ratelimit.py`'s `MoveRateLimiter` (`move_max_hz`, `--move-max-hz`), and the "if needed" is
+answered with a measurement rather than a guess: off by default, because at the shipped settings the loop
+is camera-bound and a move costs ~11 ms, so one move per frame already happens and a cap at the frame rate
+is bit-identical to uncapped; turning it on is for a *slow adapter* (pyautogui's own `PAUSE = 0.1` drops
+the loop to 6.8 fps, and a 3 Hz cap brings it back to 22.9 fps). It never queues — a frame inside the interval
+is superseded by the next due one, so a burst cannot send a backlog — and it applies to cursor moves only.
+See §2 "Cursor move rate limit" for the tables and `tests/test_move_rate_limit.py` (25 cases) for the
+pinned numbers.
 
 - Map filtered coordinates to the active screen.
 - Add dry-run and real cursor adapters.
 - Suppress movement while paused, untracked, or outside valid bounds.
-- Rate-limit or coalesce movement events if needed.
+- Rate-limit or coalesce movement events if needed. → `MoveRateLimiter` in `ratelimit.py`, wired into
+  `_move_towards()` after the move guard, reset with the filter on tracking loss, off by default.
 - Keep real output opt-in.
 
 **Verification:** test screen corners, center mapping, mirroring, bounds, pause suppression, and
@@ -778,21 +958,38 @@ tracking loss with the recording adapter. Then perform a cautious manual cursor 
 
 ### Phase 6 — Left and right clicks
 
-**Status: 🟡 3/5 + 1 partial (updated 2026-10-10, after Phase 4).** All five bullets now hold for the
-default engine — left/right clicks are one-shot events from the recogniser, a sustained pinch clicks
-once, release-and-re-arm is enforced (including the `_armed` flag that survives a resume or a tracking
-loss), and clicks are suppressed while scrolling, paused and untracked. What is still missing is
-last-action status on the preview, and the *legacy* engine still computes its pinch inline with an L1
-test instead of `gesture.is_pinch()`.
+**Status: ✅ 5/5 complete (2026-10-11).** All five bullets hold: left/right clicks are one-shot events
+from the recogniser, a sustained pinch clicks once, release-and-re-arm is enforced (including the
+`_armed` flag that survives a resume or a tracking loss), clicks are suppressed while scrolling, paused
+and untracked, and the last click/scroll is displayed on the preview (`show_last_action`, with the
+session count and the age — the readout the manual verification procedure uses).
+
+This session closed the two gaps the Phase 4 audit left: **last-action status** (the runtime records the
+actions it emits — `last_action`, `action_counts`, `summary()["actions"]` — and the HUD draws
+`last: left click  0.3s ago  (4 this session)`) and **the duplicated pinch test** (`handle_clicks()` now
+calls `gesture.is_pinch(..., metric="l1")` instead of re-writing the L1 arithmetic inline, so there is
+one pinch helper and the legacy engine's feel is unchanged — see §2 "Clicks through the recording
+adapter").
+
+**Evidence:** `tests/test_phase6_clicks.py` (32 recording-adapter cases: exactly 5 clicks for 5
+deliberate taps, 0 clicks for a flicker shorter than the hold time, the cooldown dropping rather than
+deferring a click, release-and-re-pinch, scroll precedence with and without a neutral frame, pause and
+tracking-loss suppression, the HUD line's pixels and text), plus the real loop with the mouse
+intercepted: `--synthetic-pinch left|right` → 5 clicks for 5 taps, `--synthetic-pinch two_finger` → 0
+clicks and 5 scrolls, and the legacy engine's 6 clicks for 5 taps as the documented contrast.
 
 - Convert gesture transitions into one-shot left/right click events.
 - Prevent repeated clicks during sustained pinches.
 - Require release and re-entry before another click.
 - Suppress clicks during scrolling, pausing, and tracking loss.
-- Display optional last-action status.
+- Display optional last-action status. → `show_last_action` + `last_action_text()` on the preview,
+  `last_action`/`actions()` on the runtime and in `summary()`.
 
 **Verification:** use the recording adapter to confirm exact click counts, cooldown behavior, gesture
-distinction, and suppression rules.
+distinction, and suppression rules. → `tests/test_phase6_clicks.py`, and the two-part procedure in the
+README ("Verifying clicks"): a scripted headless run (`tools/measure_loop.py --synthetic-hand --active
+--synthetic-pinch left|right|two_finger --frames 150`, which prints its own pass/CHECK verdict per pose)
+followed by a dry run, then a real run with the pointer parked over a harmless window.
 
 **Prompt:**
 > Implement Phase 6 of the webcam hand mouse roadmap. Wire debounced left- and right-click transition
@@ -802,22 +999,41 @@ distinction, and suppression rules.
 
 ### Phase 7 — Two-finger scrolling
 
-**Status: 🟡 3/5 + 1 partial (updated 2026-10-10, after Phase 4).** The two-finger gesture now exists and
-is the default: the index/middle **midpoint** is the reference, it resets on scroll entry, the dead zone
-and `scroll_gain` are config fields, direction is documented (hand down = page down), and the pose is
-suppressed as a click (scroll outranks the clicks by construction). **Horizontal movement is not yet
-implemented end to end**: the recogniser computes and reports it (`GestureEvent.secondary`) but the
-runtime only emits the vertical amount. Direction inversion as a config field and rate limiting are also
-missing, and the legacy index-finger path is unchanged (still non-conforming).
+**Status: ✅ 5/5 complete (2026-10-11).** The two-finger gesture is the default scroll path: the
+index/middle **midpoint** is the reference, it resets on scroll entry (and again after a tracking loss,
+so a reacquired hand cannot jump the page), the dead zone and `scroll_gain` are config fields, and the
+pose is suppressed as a click (scroll outranks the clicks by construction).
 
-- Use the index/middle pinch midpoint or another documented reference point.
-- Support vertical and horizontal movement.
-- Add dead zones, sensitivity, direction inversion, and rate limiting.
-- Reset the reference point when entering scroll mode.
-- Prevent scroll gestures from producing clicks.
+This session finished the three missing bullets:
+
+- **Vertical *and* horizontal movement.** `GestureEvent.secondary` is now emitted: the runtime sends it
+  to `output.hscroll()` alongside the vertical `output.scroll()`, each recorded with its `MouseEvent.axis`.
+  `scroll_horizontal_gain` (0 = off) and `--no-horizontal-scroll` restore the old vertical-only behaviour.
+- **Direction inversion.** `scroll_invert_vertical` / `scroll_invert_horizontal`, applied in the pure
+  recogniser (`_axis_amount`) alongside a separate horizontal gain; negative gains now raise instead of
+  silently inverting.
+- **Rate limiting.** `scroll_max_hz` caps scroll events per second with `ScrollRateLimiter`, which
+  **accumulates** held frames rather than dropping them (a scroll amount is a delta), and flushes the
+  remainder when the gesture ends. Off by default, for the same measured reason as `move_max_hz`.
+
+Also fixed here: per-event `int()` truncation was silently discarding up to a wheel unit per frame — 25%
+of the distance on a measured sweep. And the dead zone is now **per axis**, which horizontal scrolling
+made necessary (otherwise sideways wobble during a vertical scroll reaches the screen).
+
+- Use the index/middle pinch midpoint or another documented reference point. → the midpoint, re-anchored
+  on entry and after a tracking loss.
+- Support vertical and horizontal movement. → both axes emitted; separate gains.
+- Add dead zones, sensitivity, direction inversion, and rate limiting. → per-axis dead zone,
+  `scroll_gain`/`scroll_horizontal_gain`, `scroll_invert_*`, `scroll_max_hz` (accumulating).
+- Reset the reference point when entering scroll mode. → on entry, and on reacquire.
+- Prevent scroll gestures from producing clicks. → scroll outranks both pinches in `GESTURE_PRIORITY`.
 
 **Verification:** test vertical, horizontal, diagonal, stationary, reversed, and tracking-loss
-sequences with recorded scroll events.
+sequences with recorded scroll events. → `tests/test_phase7_scroll.py` (42 cases: the pure geometry, both
+axes through the recording adapter, inversion and zero-gain switches, the accumulating cap, the
+truncation bug, and the sweep harness's verdict), plus the controlled harness run in §2 "Two-finger
+scrolling on both axes" (real camera, wheel calls intercepted: −174 / +174 units with the expected sign
+per axis and 0 events on the other) and the manual procedure in the README.
 
 **Prompt:**
 > Implement Phase 7 of the webcam hand mouse roadmap. Add two-finger pinch scrolling with a resettable
@@ -934,6 +1150,31 @@ tracking, sustained gestures, repeated launch/cleanup, and full regression check
   constant, either feed it the units it was tuned for or re-derive it — and measure, because this class
   of bug is invisible in the code and described by the user as "it feels bad".
 
+- **A knob that can only make things worse ships off, with the measurement beside it.** `move_max_hz`
+  defaults to 0 because the uncapped path is already at the camera's rate; the limiter exists for the
+  case the measurement found (a slow adapter) and the cost is documented in numbers (§2 "Cursor move rate
+  limit", gotcha 8.15) rather than defended in prose. Same shape as `deadzone`: the value that is right
+  for the default configuration is the one the harness measured, not the one that sounds careful.
+- **One decided rule, one helper, with its variants as explicit arguments.** Phase 6 ended the second
+  copy of the pinch arithmetic by giving `gesture.is_pinch()` a `metric` argument
+  (`PINCH_METRICS = ("euclidean", "l1")`) instead of leaving the legacy engine to compute L1 inline: the
+  default stays Euclidean, `"l1"` reproduces the prototype exactly, and an unknown metric raises. When a
+  compatibility path needs different arithmetic, parameterise the one implementation and prove the
+  equivalence — do not fork it.
+- **Behaviours that only *report* are the ones that can be on by default.** The last-action line
+  (`show_last_action`) draws what the pipeline already did and emits nothing itself, so it is on; the
+  rate limit changes output and is off. Ask what a new default costs before making it one.
+- **An increment is not a position, so the same cap needs opposite handling.** `MoveRateLimiter`
+  *supersedes* a held frame (the newest cursor position wins and nothing is queued); `ScrollRateLimiter`
+  *accumulates* it (dropping a scroll amount would lose that much scrolling). Same timing code, opposite
+  policy, and the distinction is the reason there are two classes instead of one — see §2 "Two-finger
+  scrolling".
+- **Rounding per event is a distance bug when the events are small.** Every scroll amount used to be
+  truncated to an int before it reached the wheel; with a slow hand each frame asks for a fraction of a
+  unit, and 25% of a measured sweep went missing (135 units of 180). Amounts now carry their remainder
+  through the accumulator. When a value is quantised for an API, ask what happens to the discarded part
+  — if it accumulates anywhere, it must accumulate *here*.
+
 ---
 
 ## 7. Pre-report checklist
@@ -944,10 +1185,20 @@ Before reporting a phase complete:
 - [ ] `python3 kinematic/main.py` and `python3 -m kinematic.main` both still start.
 - [ ] No test or default configuration can move the real cursor, click or scroll.
 - [ ] New behaviour is additive; existing working behaviour is unchanged.
+- [ ] If anything visual changed (preview orientation, overlay, readout), the layer drawn and the data it
+      draws are in the same frame of reference — see gotcha 8.17 — and `--preview-flip` was checked in the
+      mode the change was about.
 - [ ] Any measured number is backed by a recorded run (seed + config stored), not a guess.
-- [ ] Anything touching the pointer path (reference, deadzone, filter, gain, mapping) is checked with
-      `python3 tools/measure_smoothness.py` and, for reach, `python3 tools/measure_loop.py
-      --synthetic-hand --active --sweep-reach 30 --reach-dwell 12`.
+- [ ] Anything touching the pointer path (reference, deadzone, filter, gain, mapping, rate limit) is
+      checked with `python3 tools/measure_smoothness.py` and, for reach, `python3 tools/measure_loop.py
+      --synthetic-hand --active --sweep-reach 30 --reach-dwell 12`; a change to `move_max_hz` or to the
+      move path also gets `--rate-sweep`.
+- [ ] Anything touching the click/scroll path is checked with `python3 tools/measure_loop.py
+      --synthetic-hand --active --synthetic-pinch left|right|two_finger --frames 150`: the tool's verdict
+      line must read `pass - one click per deliberate tap` (or 0 clicks + scrolls for the two-finger pose).
+- [ ] A change to the scroll path is checked with `python3 tools/measure_loop.py --synthetic-hand
+      --active --synthetic-scroll vertical|horizontal|diagonal --frames 150`, where the verdict line must
+      read `pass` with the expected sign on the expected axis (and 0 events on the other one).
 - [ ] The §2 phase status table and this phase's own `Status:` line are updated to match what you
       actually built (they are the next session's starting point).
 - [ ] Anything the platform cannot do is stated plainly, not papered over.
@@ -1082,3 +1333,41 @@ screen-pixel positions, but One Euro's `beta` is defined for pixel-scale coordin
 nothing in the code or the tests looked wrong; the symptom was the user reporting a stutter.
 `one_euro_beta` is now 0.0 with a 4 Hz cutoff. When wiring any tuned constant, check the units of both
 sides and measure the response (`tools/measure_smoothness.py`, `--one-euro-beta`), not just that it runs.
+
+**8.14 A derived metric's sampling rule is part of the measurement.** `measure_smoothness.py` reports how
+far the cursor trails the hand; the first version sampled the *ideal* path by the move's index in the move
+list. That is right only while moves are one per frame — with held frames (or, later, a rate limit) move
+#i happens several frames in, so the tool was comparing the cursor against a point the hand had not
+reached yet and over-reported the gap. Corrected to sample on the *frame each move was emitted on*, the
+old deadzone's "**+39 px of trailing**" is really **+15.5 px** (same run, same seed). Before quoting a
+derived number, check what it is sampled against; a wrong sampling rule produces plausible numbers that
+survive code review and tests, exactly like 8.13's unit mismatch.
+
+**8.15 A rate limit only helps below the rate you are already achieving.** The Phase 5 limiter was
+motivated by "the adapter can be slow", and the obvious assumption — "cap the moves and the loop gets its
+time back" — is only true when the cap is *under* what the loop currently does. Measured with
+`--mouse-pause 0.1` (a ~113 ms adapter): 6.78 fps uncapped, **6.76 fps with `--move-max-hz 8`** (no
+change: the loop is already slower than the cap, so nothing is suppressed), then 17.4 fps at 5 Hz and
+22.9 fps at 3 Hz. The cost side is just as concrete: the same cap triples the mean step size on a slow
+sweep (6.2 px → 18.7 px at 10 Hz), which is the hold-then-jump feel the smoothness work removed. Hence
+`move_max_hz = 0` by default and a table in §2 instead of an opinion.
+
+**8.16 Quantising a per-event value discards the movement the events are made of.** Scroll amounts were
+converted to `int` at each emission. With a hand moving slowly that is well under one wheel unit per
+frame (a hand width is 900 units, and a frame of a slow sweep is ~1), so the discarded fraction was the
+whole event and the total was 25% short: measured on a controlled sweep, **135 units emitted of the 180
+the hand travelled**. Nothing looked wrong — each event was a plausible small number. Amounts now enter
+`ScrollRateLimiter` as floats and the remainder carries to the next event (`flush()` at the end of the
+gesture sends the last whole units). The same trap applies to any accumulated quantity that gets rounded
+before it is summed: round at the boundary, not per sample.
+
+**8.17 An overlay drawn in a different frame of reference than its data looks "reversed".** The preview
+composed the *captured* frame while every landmark came from the *mirrored* frame MediaPipe was fed
+(`process_frame` flips for detection) — so the skeleton was drawn reflected beside the hand, and the
+footage on screen was the raw camera view while the pointer moved according to the mirrored one. Two
+symptoms, one cause: an overlay and its data must share one coordinate system. The flip is now one
+config field (`preview_flip`) that decides both halves together (`preview.display_frame` for the image,
+`preview.landmark_flip` for the landmarks), each of the four modes is tested against a marker-block hand
+at a known asymmetric world position, and the readout text is drawn *after* the flip so it is never
+mirrored. When something on screen looks backwards, check what frame each layer is in before flipping
+individual ones.

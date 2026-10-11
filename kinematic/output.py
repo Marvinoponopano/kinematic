@@ -24,6 +24,7 @@ class MouseEvent:
     value: Any  # (x, y) for move, button name for click, amount for scroll
     at: float  # time.monotonic() when it happened
     duration: float = 0.0  # tween the move was asked for (0 = teleport)
+    axis: str = "vertical"  # "vertical" | "horizontal" — which wheel axis a scroll used
 
 
 class MouseOutput:
@@ -41,7 +42,17 @@ class MouseOutput:
     def click(self, button: str = "left") -> None:
         raise NotImplementedError
 
-    def scroll(self, amount: int) -> None:
+    def scroll(self, amount: int, x: Optional[float] = None, y: Optional[float] = None) -> None:
+        """Vertical wheel scroll: positive scrolls up, negative scrolls down."""
+        raise NotImplementedError
+
+    def hscroll(self, amount: int, x: Optional[float] = None, y: Optional[float] = None) -> None:
+        """Horizontal wheel scroll (Phase 7). Positive is right in pyautogui's convention.
+
+        Kept separate from :meth:`scroll` rather than folded into it because the two go to different
+        wheel axes in the OS event (pyautogui's ``scroll`` and ``hscroll``), and because a recording
+        adapter has to be able to tell them apart in a test.
+        """
         raise NotImplementedError
 
 
@@ -78,8 +89,15 @@ class RealMouseOutput(MouseOutput):
     def click(self, button: str = "left") -> None:
         self._pyautogui.click(button=button)
 
-    def scroll(self, amount: int) -> None:
-        self._pyautogui.scroll(amount)
+    def scroll(self, amount: int, x: Optional[float] = None, y: Optional[float] = None) -> None:
+        self._pyautogui.scroll(amount, x=x, y=y)
+
+    def hscroll(self, amount: int, x: Optional[float] = None, y: Optional[float] = None) -> None:
+        """Horizontal wheel scroll. macOS supports it (``_pyautogui_osx._hscroll`` posts a 2-axis
+        ``CGEventCreateScrollWheelEvent``); pyautogui's own docstring saying horizontal scrolling is
+        "currently just Linux" is stale. It also moves the pointer to (x, y) first, which resolves to
+        the current position when both are None — a harmless no-op move."""
+        self._pyautogui.hscroll(amount, x=x, y=y)
 
 
 class RecordingMouseOutput(MouseOutput):
@@ -107,8 +125,11 @@ class RecordingMouseOutput(MouseOutput):
     def click(self, button: str = "left") -> None:
         self.events.append(MouseEvent("click", button, time.monotonic()))
 
-    def scroll(self, amount: int) -> None:
-        self.events.append(MouseEvent("scroll", int(amount), time.monotonic()))
+    def scroll(self, amount: int, x: Optional[float] = None, y: Optional[float] = None) -> None:
+        self.events.append(MouseEvent("scroll", int(amount), time.monotonic(), axis="vertical"))
+
+    def hscroll(self, amount: int, x: Optional[float] = None, y: Optional[float] = None) -> None:
+        self.events.append(MouseEvent("scroll", int(amount), time.monotonic(), axis="horizontal"))
 
     def of_kind(self, kind: str) -> List[MouseEvent]:
         return [event for event in self.events if event.kind == kind]
@@ -123,9 +144,23 @@ class RecordingMouseOutput(MouseOutput):
 
     @property
     def scrolls(self) -> List[MouseEvent]:
+        """Every scroll call, both axes (``axis`` says which)."""
         return self.of_kind("scroll")
 
+    def scrolls_on(self, axis: str) -> List[MouseEvent]:
+        """Just the scroll calls on one wheel axis."""
+        return [event for event in self.scrolls if event.axis == axis]
+
+    @property
+    def vertical_scrolls(self) -> List[MouseEvent]:
+        return self.scrolls_on("vertical")
+
+    @property
+    def horizontal_scrolls(self) -> List[MouseEvent]:
+        return self.scrolls_on("horizontal")
+
     def counts(self) -> dict:
+        """Calls per kind. ``scroll`` counts both axes — use the properties above to split them."""
         return {
             "move": len(self.moves),
             "click": len(self.clicks),
