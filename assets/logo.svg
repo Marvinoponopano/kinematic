@@ -1,0 +1,21 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" role="img" aria-labelledby="title desc">
+  <title id="title">Kinematic symbol</title>
+  <desc id="desc">A hand-tracking joint graph inside a circular motion arc.</desc>
+  <defs>
+    <linearGradient id="arc" x1="16" y1="108" x2="112" y2="20" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#54d6c7"/>
+      <stop offset="1" stop-color="#8ba7ff"/>
+    </linearGradient>
+  </defs>
+  <rect width="128" height="128" rx="28" fill="#0b1020"/>
+  <path d="M21 93a49 49 0 0 1 76-55" fill="none" stroke="url(#arc)" stroke-linecap="round" stroke-width="5"/>
+  <path d="M91 30l10 8-12 4" fill="none" stroke="#8ba7ff" stroke-linecap="round" stroke-linejoin="round" stroke-width="4"/>
+  <g fill="#0b1020" stroke="#f4f7ff" stroke-width="4">
+    <path d="M43 92 51 67 61 44 71 52 83 36 91 43 80 63 94 58 99 67 78 80 68 96Z"/>
+    <circle cx="43" cy="92" r="6" fill="#54d6c7"/>
+    <circle cx="51" cy="67" r="6" fill="#54d6c7"/>
+    <circle cx="61" cy="44" r="6" fill="#8ba7ff"/>
+    <circle cx="83" cy="36" r="6" fill="#8ba7ff"/>
+    <circle cx="94" cy="58" r="6" fill="#54d6c7"/>
+  </g>
+</svg>
