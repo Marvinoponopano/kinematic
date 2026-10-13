@@ -538,8 +538,8 @@ cases) and by the loop harness. What the phase added on top of Phase 4's recogni
   `last: left click  0.3s ago  (4 this session)` on the line below the sensitivity dial. It appears once
   the first action has fired, so a fresh session draws nothing extra (which is also why the older
   preview tests still pass unchanged). Because it counts *emitted* actions, it works under `--dry-run` as
-  the readout for "what would have been sent" — that is what the manual click verification procedure in
-  the README is built on.
+  the readout for "what would have been sent" — which is what the manual click verification in §7
+  "Manual verification on hardware" is built on.
 * **The duplicated pinch test is gone.** `runtime.handle_clicks()` (the legacy engine) used to compute
   `abs(dx) + abs(dy) < click_threshold` inline; it now calls `gesture.is_pinch(..., metric="l1")`. The
   metric is an explicit argument (`PINCH_METRICS = ("euclidean", "l1")`) instead of an accident of where
@@ -663,7 +663,8 @@ positive macOS horizontal wheel value. pyautogui's `hscroll` (whose docstring sa
 is "currently just Linux" — stale: `_pyautogui_osx._hscroll` posts a 2-axis `CGEventCreateScrollWheelEvent`)
 takes the sign from Quartz, and finding out what an app does with it would mean scrolling the user's
 screen. So the convention is documented (hand right → positive) and `scroll_invert_horizontal` is the
-one-field fix; the README's manual test says to check it and flip that field if it feels backwards.
+one-field fix; the manual list in §7 "Manual verification on hardware" says to check it and flip that
+field if it feels backwards.
 
 ### Pinch press-and-hold: hold to drag (fixed 2026-10-11)
 
@@ -869,11 +870,11 @@ The per-phase counts below are the current ones, not that first audit's.
 | 3 — Geometry/mapping/smoothing | ✅ **5/5 (2026-10-10)** | `gesture.py`: distances, `midpoint`/`midpoints`, `pinch_distances`, `hand_scale` + `hand_span`, `clamp`/`clamp_point`, `mirror_point`, EMA; `mapping.py`: `Region` + `map_point_to_screen` (frame region → screen region, clamping, mirroring); `smoothing.py`: EMA + 1-euro filters with `reset()`, wired into the runtime with a tracking-loss reset; 44 deterministic tests for distances, clamping, smoothing, latency and reset | Midpoints are available but not yet *used* by a gesture; One Euro parameters are tuned for this camera rather than for everyone |
 | 4 — Gesture state machine | ✅ **5/5 (2026-10-10)** | `recognizer.py`: `HandState` (neutral / left pinch / right pinch / two-finger scroll / paused / tracking-lost), `EventKind` + `GestureEvent`, `GestureThresholds`/`Observation`/`GestureUpdate`, `GESTURE_PRIORITY`; thumb–index vs thumb–middle pinch detection from `pinch_distances()` ÷ `hand_scale`; per-pair hysteresis, hold time, cooldown, re-arm (`reset(disarm=True)`), scroll-priority resolution, "no switch without neutral", scroll reference/dead-zone/gain; wired into the runtime via `apply_gestures()` behind `can_emit`, with the paused/tracking states driven by the pause key and the frame loop; 72 new tests (54 recogniser + 18 runtime) | The thresholds are reasoned defaults, not measured against a real hand (Phase 9 owns calibration) — **Phase 7 has since emitted the horizontal component** (`GestureEvent.secondary`), which this row listed as missing when it was written |
 | 5 — Cursor movement | ✅ **5/5 (2026-10-11)** | **Absolute position mapping is now the default scheme** (`pointer_mode="absolute"`, inner 70% of the frame → whole screen) with the dial scales its reach, so every screen edge and corner is directly reachable — measured, see §2 "Reach and the sensitivity floor"; palm/wrist-relative pipeline still available and tested; smoothing, clamp and `min_move_pixels`; **dry-run and real adapters**; **opt-in gate** (starts paused, `--dry-run`); paused/bounds suppression; the explicit *tracking-lost* state (`HandState.TRACKING_LOST`, emitted once per loss, filter and anchor reset); **`ratelimit.py`'s `MoveRateLimiter`** — the last bullet: a pure, timestamp-driven cap that coalesces (never queues) cursor moves, reported by `summary()["moves_suppressed"]`, off by default because the measurement says it is only needed when the adapter is slow (25 new tests, `--rate-sweep`, `--mouse-pause`) | — |
-| 6 — Left & right clicks | ✅ **5/5 (2026-10-11)** | Left click, right click (thumb–middle), shared cooldown, release-then-re-arm, **scroll precedence** — all in the recogniser, whose 72 tests assert exact click counts and whose 32 new recording-adapter tests (`test_phase6_clicks.py`) pin the counts per tap, the cooldown drop, re-arm, pause/tracking-loss suppression and the HUD readout; **suppressed while paused** (Phase 1's `can_emit` gate and the recogniser's own `PAUSED` state, including a pinch held across a resume); **last-action status** on the preview (`show_last_action`, `last_action`, `summary()["actions"]`), which doubles as the readout for the manual click verification procedure in the README; the legacy path is still reachable via `--gesture-engine legacy` and now uses the shared `gesture.is_pinch(..., metric="l1")` instead of a second inline copy of the metric; measured in the real loop: 5 clicks / 5 taps left, 5 right, 0 clicks + 5 scrolls for the two-finger pose | Hovering a click's target is still not tracked (the phase's optional extra); the legacy engine's one-or-two-clicks-per-tap behaviour is unchanged by design |
+| 6 — Left & right clicks | ✅ **5/5 (2026-10-11)** | Left click, right click (thumb–middle), shared cooldown, release-then-re-arm, **scroll precedence** — all in the recogniser, whose 72 tests assert exact click counts and whose 32 new recording-adapter tests (`test_phase6_clicks.py`) pin the counts per tap, the cooldown drop, re-arm, pause/tracking-loss suppression and the HUD readout; **suppressed while paused** (Phase 1's `can_emit` gate and the recogniser's own `PAUSED` state, including a pinch held across a resume); **last-action status** on the preview (`show_last_action`, `last_action`, `summary()["actions"]`), which doubles as the readout for the manual click verification in §7 "Manual verification on hardware"; the legacy path is still reachable via `--gesture-engine legacy` and now uses the shared `gesture.is_pinch(..., metric="l1")` instead of a second inline copy of the metric; measured in the real loop: 5 clicks / 5 taps left, 5 right, 0 clicks + 5 scrolls for the two-finger pose | Hovering a click's target is still not tracked (the phase's optional extra); the legacy engine's one-or-two-clicks-per-tap behaviour is unchanged by design |
 | 7 — Two-finger scroll | ✅ **5/5 (2026-10-11)** | Two-finger (index+middle) pose with the midpoint as reference, reference reset on entry, **per-axis dead zone**, configurable `scroll_gain` (vertical) and `scroll_horizontal_gain` (horizontal, `0` = the pre-Phase-7 behaviour of dropping the sideways component), `scroll_invert_vertical`/`scroll_invert_horizontal`, **both wheel axes emitted** (`output.scroll` + `output.hscroll`, distinguished by `MouseEvent.axis`), **click suppression while scrolling** (the pose scrolls instead of clicking), and a `scroll_max_hz` cap that **accumulates** held frames instead of dropping them → distance preserved; measured in the real loop: a vertical sweep −174 units with 0 sideways events, horizontal +174 with 0 vertical, diagonal both, 0 clicks; 42 new tests | The *content* direction of a positive macOS horizontal wheel value is inherited from Quartz and is not verifiable without scrolling the user's screen — hence `scroll_invert_horizontal`; the **legacy** index-finger scroll path is unchanged (still non-conforming: it never had hold/hysteresis or the two-finger reference) |
 | 8 — Pause/runtime/feedback | ✅ **5/5 (2026-10-11)** | `runtime.py` coordinator; configurable keyboard toggle (`toggle_pause_keys`) with paused startup; PAUSED/ACTIVE **and the live gesture state** on the preview (`f"… fps  {gesture_state}"`); the recogniser's `PAUSED`/`TRACKING_LOST` states, kept in step by `_sync_gesture_pause()` and the no-hand branch; exception-safe teardown (`try/finally`); **the opt-in gesture pause** (an open hand held `gesture_pause_hold_seconds`, one toggle per hold, released to re-arm, works *while* paused so the same pose resumes, and emits nothing to the desktop — `--gesture-pause`); **window close is a real exit**; **every path that ends the run releases a held button** (`release_held_buttons()` on `run()`'s `finally` and on `close()`, §2 "Pinch press-and-hold") — 37 cases in `test_phase8_runtime.py` cover toggle idempotence, recovery after a failed run, cleanup on exit / window close / exception, three launch/close cycles leaving no capture thread, and the six teardown-release cases | — |
-| 9 — Calibration/hardening | ✅ **5/5 (2026-10-11)** | `HandMouseConfig` with the tunables this phase asks for — camera, margins, smoothing, pinch thresholds, cooldown, hotkeys (`toggle_pause_keys`/`quit_keys`/the dial's key tuples) and sensitivity, now adjustable at **runtime** via the dial (`set_sensitivity`/`adjust_sensitivity`, `]`/`[`/`0`, `--sensitivity`, `--sensitivity-step`); **mirroring is a config field now** (`preview_flip` / `--preview-flip`, 2026-10-11) | **Configuration/calibration** (all of it: camera, mirroring, margins, smoothing, pinch thresholds, cooldown, sensitivity, hotkeys — with the dial adjustable at *runtime*); **`diagnostics.py` + `--diagnose`** (camera, screen, MediaPipe, Accessibility, configuration; read-only; the denial path diagnosed in-app); **`log.py` + `--log-level`/`--log-file`** (JSON lines, named events, silent by default, no per-frame cost); **`tools/profile_loop.py`** + the measured stage table and the two *rejected* optimisations (§2 "Diagnostics, logging and profiling"); **`pyproject.toml`** with the `kinematic` console script, verified by building the wheel; the README's setup section and **final macOS verification checklist**. 99 new tests: `test_phase8_runtime.py` (31), `test_phase9_diagnostics.py` (31), `test_phase9_logging.py` (18), `test_phase9_e2e.py` (19) | One honest gap and one deliberate one: **the dial's value is per-session** (no settings file — pass `--sensitivity` to pin it), and the hardware-dependent half of the checklist is manual on purpose, because the suite must never touch the desktop. Also still open from earlier phases: no CI, and the legacy engine's non-conforming scroll path |
-| Tests | 494 passing | gesture helpers; config defaults; cursor-move guard; camera error path; the Phase 1 safety suite; the pointer-reference suite; the landmark suite; the Phase 3 geometry and smoothing suites; the Phase 4 recogniser suite (64 cases: 54 + 10 press-and-hold, incl. a release that fires when engagement ends while paused) and runtime suite (18 cases); the Phase 6 click suite (37 cases, incl. 6 press-and-hold-through-the-adapter cases); the move-rate-limit suite (25 cases); the Phase 7 scroll suite (42 cases: per-axis dead zone, both axes through the recording adapter, sign/gain/inversion maths, the accumulating rate cap, the sweep harness's verdict); the preview-orientation suite (18 cases: all four flip modes, and the skeleton landing on the hand in each); the sensitivity-dial suite (38 cases); the pointer-modes suite (21 cases); the smoothness suite (15 cases); the Phase 8 suite (37 cases: the gesture pause, the teardown guarantees, and six cases proving every exit path lifts a held button); the Phase 9 diagnostics suite (31 cases, incl. the `--diagnose` CLI path) and logging suite (18 cases); the Phase 9 end-to-end suite (19 cases: denied permissions, unavailable camera, low light, partial tracking, sustained gestures, repeated launch, a call-by-call scripted session) | MediaPipe's own detections, the real camera path, the legacy click/scroll branches beyond the pinned cases, the on-screen *direction* of a horizontal wheel event, and the hardware half of the README's final checklist (a camera negotiating frames, a real hand, the OS obeying a move) — all manual by design |
+| 9 — Calibration/hardening | ✅ **5/5 (2026-10-11)** | `HandMouseConfig` with the tunables this phase asks for — camera, margins, smoothing, pinch thresholds, cooldown, hotkeys (`toggle_pause_keys`/`quit_keys`/the dial's key tuples) and sensitivity, now adjustable at **runtime** via the dial (`set_sensitivity`/`adjust_sensitivity`, `]`/`[`/`0`, `--sensitivity`, `--sensitivity-step`); **mirroring is a config field now** (`preview_flip` / `--preview-flip`, 2026-10-11) | **Configuration/calibration** (all of it: camera, mirroring, margins, smoothing, pinch thresholds, cooldown, sensitivity, hotkeys — with the dial adjustable at *runtime*); **`diagnostics.py` + `--diagnose`** (camera, screen, MediaPipe, Accessibility, configuration; read-only; the denial path diagnosed in-app); **`log.py` + `--log-level`/`--log-file`** (JSON lines, named events, silent by default, no per-frame cost); **`tools/profile_loop.py`** + the measured stage table and the two *rejected* optimisations (§2 "Diagnostics, logging and profiling"); **`pyproject.toml`** with the `kinematic` console script, verified by building the wheel; the README's user-facing setup, controls and safety sections, and §7's **manual verification list**. 99 new tests: `test_phase8_runtime.py` (31), `test_phase9_diagnostics.py` (31), `test_phase9_logging.py` (18), `test_phase9_e2e.py` (19) | One honest gap and one deliberate one: **the dial's value is per-session** (no settings file — pass `--sensitivity` to pin it), and the hardware-dependent half of the checklist is manual on purpose, because the suite must never touch the desktop. Also still open from earlier phases: no CI, and the legacy engine's non-conforming scroll path |
+| Tests | 494 passing | gesture helpers; config defaults; cursor-move guard; camera error path; the Phase 1 safety suite; the pointer-reference suite; the landmark suite; the Phase 3 geometry and smoothing suites; the Phase 4 recogniser suite (64 cases: 54 + 10 press-and-hold, incl. a release that fires when engagement ends while paused) and runtime suite (18 cases); the Phase 6 click suite (37 cases, incl. 6 press-and-hold-through-the-adapter cases); the move-rate-limit suite (25 cases); the Phase 7 scroll suite (42 cases: per-axis dead zone, both axes through the recording adapter, sign/gain/inversion maths, the accumulating rate cap, the sweep harness's verdict); the preview-orientation suite (18 cases: all four flip modes, and the skeleton landing on the hand in each); the sensitivity-dial suite (38 cases); the pointer-modes suite (21 cases); the smoothness suite (15 cases); the Phase 8 suite (37 cases: the gesture pause, the teardown guarantees, and six cases proving every exit path lifts a held button); the Phase 9 diagnostics suite (31 cases, incl. the `--diagnose` CLI path) and logging suite (18 cases); the Phase 9 end-to-end suite (19 cases: denied permissions, unavailable camera, low light, partial tracking, sustained gestures, repeated launch, a call-by-call scripted session) | MediaPipe's own detections, the real camera path, the legacy click/scroll branches beyond the pinned cases, the on-screen *direction* of a horizontal wheel event, and the hardware half of §7's manual verification list (a camera negotiating frames, a real hand, the OS obeying a move) — all manual by design |
 
 **What this means for the next session:**
 
@@ -1201,10 +1202,10 @@ scroll path. Verified identical before and after the press-and-hold change.)
   `last_action`/`actions()` on the runtime and in `summary()`.
 
 **Verification:** use the recording adapter to confirm exact click counts, cooldown behavior, gesture
-distinction, and suppression rules. → `tests/test_phase6_clicks.py`, and the two-part procedure in the
-README ("Verifying clicks"): a scripted headless run (`tools/measure_loop.py --synthetic-hand --active
---synthetic-pinch left|right|two_finger --frames 150`, which prints its own pass/CHECK verdict per pose)
-followed by a dry run, then a real run with the pointer parked over a harmless window.
+distinction, and suppression rules. → `tests/test_phase6_clicks.py`, and the two-part procedure in §7
+"Manual verification on hardware": a scripted headless run (`tools/measure_loop.py --synthetic-hand
+--active --synthetic-pinch left|right|two_finger --frames 150`, which prints its own pass/CHECK verdict
+per pose) followed by a dry run, then a real run with the pointer parked over a harmless window.
 
 **Prompt:**
 > Implement Phase 6 of the webcam hand mouse roadmap. Wire debounced left- and right-click transition
@@ -1248,7 +1249,7 @@ sequences with recorded scroll events. → `tests/test_phase7_scroll.py` (42 cas
 axes through the recording adapter, inversion and zero-gain switches, the accumulating cap, the
 truncation bug, and the sweep harness's verdict), plus the controlled harness run in §2 "Two-finger
 scrolling on both axes" (real camera, wheel calls intercepted: −174 / +174 units with the expected sign
-per axis and 0 events on the other) and the manual procedure in the README.
+per axis and 0 events on the other) and the manual procedure in §7 "Manual verification on hardware".
 
 **Prompt:**
 > Implement Phase 7 of the webcam hand mouse roadmap. Add two-finger pinch scrolling with a resettable
@@ -1340,10 +1341,10 @@ asks for:
   input size; `_pyautogui_osx._moveTo` saves 0.24 ms of 11.36) — see §2 "Diagnostics, logging and
   profiling", which is also where the slow-adapter case (108.6 ms/move → 8.47 fps) is recorded.
 - **Packaging and final setup documentation.** `pyproject.toml` (setuptools, `requires-python >=3.9`,
-  the pinned dependencies, the `kinematic` console script) plus the README's setup section, its
-  diagnostics/logging/profiling sections, and a **final macOS verification checklist** covering fresh
-  setup, both permissions, the dry-run pipeline, every gesture, the gesture pause, logging, packaging
-  and repeated launch/cleanup. The wheel is built with a separate interpreter to verify the metadata
+  the pinned dependencies, the `kinematic` console script) plus the README's user-facing sections
+  (quick start, controls, safety, license) and this file's **manual verification list** in §7, covering
+  fresh setup, both permissions, the dry-run pipeline, every gesture, the gesture pause, logging,
+  packaging and repeated launch/cleanup. The wheel is built with a separate interpreter to verify the metadata
   without installing into the 3.9 environment.
 
 **Verification evidence** for the phase's own bar ("fresh setup, denied permissions, unavailable
@@ -1499,6 +1500,39 @@ Before reporting a phase complete:
       actually built (they are the next session's starting point).
 - [ ] Anything the platform cannot do is stated plainly, not papered over.
 
+### Manual verification on hardware
+
+The half of "it works" that no test may touch: a camera, a hand, and the OS obeying a pointer move. Run
+it after a change to the pointer, click or scroll path, and after anything that touches permissions,
+packaging or the preview. (The user-facing long form of this list, with the pose-by-pose steps, lived in
+the README until 2026-10-13; it is in git history at `693d695` if the prose is wanted back.)
+
+**Fresh setup** — `python3 -m pip install -r requirements.txt` succeeds; `mediapipe` is 0.10.14 (or
+≤ 0.10.21, gotcha 8.2); `python3 -m kinematic.main --diagnose --no-camera-probe` reports `ok` for
+platform, mediapipe, output, screen and configuration.
+
+**Permissions** — the camera check passes with a resolution and brightness; Accessibility shows
+`granted to this process`; revoking Accessibility makes the startup line and `--diagnose` name it (and
+exit non-zero).
+
+**Pipeline, nothing moving on the desktop** — `--dry-run` starts **paused** and emits nothing; `SPACE`
+switches the HUD to `ACTIVE`; `ESC`/`q` quits with no traceback; `python3 -m unittest discover -s tests`
+→ 494 tests `OK`; `tools/measure_loop.py --synthetic-hand --active --frames 150` → 5 clicks / 5 taps;
+`tools/measure_smoothness.py` and `tools/profile_loop.py --synthetic-hand --active` run with no camera.
+
+**Gestures (dry run first, then live over a harmless window)** — one `left click` per deliberate pinch;
+**drag**: pinch, hold, move the hand → the button stays down for the whole hold, and opening the hand
+releases it; **no stuck button on exit**: start a drag, then `ESC`/`q` (or close the preview window)
+while still pinching → the button is released and a following click behaves normally; two-finger
+down/up scrolls the page (hand down = page down) and never clicks, with the direction switches as the
+one-field fix; reach (every corner reachable with the hand *stopped* there) and the sensitivity dial is
+drawn without moving the cursor by itself; finger curl does not move the cursor; the gesture pause
+toggles after its hold and never clicks.
+
+**Logging, packaging, cleanup** — `--log-level info --log-file run.jsonl` writes JSON lines whose levels
+behave; `~/.local/bin/python3.11 -m pip wheel . --no-deps --no-build-isolation` still builds; three
+launch/close cycles leave no capture thread and release the camera each time.
+
 ---
 
 ## 8. Gotchas (each one cost real debugging time — keep them fixed)
@@ -1567,13 +1601,24 @@ import statements for dynamic package handling and update mediapipe version cons
   never merge the two mechanisms.
 - `requirements.txt` — was the only other divergence (the branch pinned `mediapipe==0.10.14` while this
   checkout said `>=0.10.14`); **`main` now pins `0.10.14` too** (8.2), so the file matches the branch.
-- `README.md` — **differs**: this checkout has the extra "run the entry point directly" paragraph.
+- `README.md` — **differs**: that branch carries its own README. Moot since 2026-10-13, when this
+  checkout's README was deliberately replaced by a shorter user-facing rewrite (see below).
 
 Consequences: Copilot may write into this directory again (it already did once, silently reformatting
 `main.py` at 13:28 and dropping an edit), editing a file here does not change it there, and untracked
 files here are not protected by git. Before starting a phase, state which copy you are working in. The
 branch commits are the only tracked record of the prototype, so if you consolidate the two, do it
 deliberately rather than by overwriting either side.
+
+**Observed again on 2026-10-13, from outside this session.** While a session was mid-work, `README.md`
+was replaced with a shorter user-facing rewrite (quick start, controls table, safety), and
+`assets/logo.svg`, `assets/banner.svg` and a uv-created `.venv/` (Python 3.14) appeared beside it. The
+rewrite was **intentional** (the user confirmed it) and is committed, along with the assets; the
+detailed README it replaced — config tables, measured numbers, the long manual checklist — is in git
+history at `693d695`, and the parts tests still depend on were moved into this file (§2, §7 "Manual
+verification on hardware"). The lesson for the next session: when the tree looks different from what you
+left, check `git status`, `git diff --stat` and file mtimes **before** concluding your own edits are
+intact — and never assume a file you did not touch is unchanged.
 
 **8.9 Never smoke-test this app by launching it.**
 With the camera permission granted (8.4), `python3 kinematic/main.py` and `python3 -m kinematic.main`

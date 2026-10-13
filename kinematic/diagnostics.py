@@ -335,7 +335,7 @@ def format_report(checks: Sequence[Check], title: str = "Kinematic diagnostics")
     lines.append("")
     if failures:
         lines.append(f"{len(failures)} check(s) failed: {', '.join(check.name for check in failures)}")
-        lines.append("Fix those before expecting the pointer to move; see README 'Setup' for the long form.")
+        lines.append("Fix those before expecting the pointer to move; see README 'Quick Start' for the long form.")
     else:
         lines.append("All checks passed. The app can run: `python3 -m kinematic.main` (starts paused).")
     return "\n".join(lines)
