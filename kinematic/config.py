@@ -208,3 +208,28 @@ class HandMouseConfig:
     #   line below the sensitivity dial once the first action has fired, and it is the readout the
     #   manual click verification procedure uses — including under --dry-run, where it shows what
     #   *would* have been sent without anything reaching the desktop.
+
+    # --- Phase 8: the optional gesture pause ---------------------------------
+    gesture_pause_enabled: bool = False
+    #   Off by default. When on, holding an *open hand* (all four fingers straight, no pinch engaged)
+    #   for gesture_pause_hold_seconds toggles pause/resume, exactly like SPACE — and it works while
+    #   paused too, which is what makes the same pose resume. Off by default because a pose that can
+    #   freeze the pointer has to be a deliberate choice: a stretch on the way to a pinch must not
+    #   stop the mouse, and the hold time is what keeps that safe.
+    gesture_pause_fingers: int = 4
+    #   How many of the four fingers (index -> pinky) must be straight for the pause pose.
+    gesture_pause_hold_seconds: float = 1.2
+    #   How long the open hand must be held before it toggles. Long on purpose: the hand passes
+    #   through open shapes constantly while it moves, and only a deliberate hold should act.
+
+    # --- Phase 9: logging and diagnostics ------------------------------------
+    log_level: str = "warning"
+    #   Level for the structured (JSON-lines) log: debug, info, warning or error. The default is
+    #   deliberately quiet — the pipeline logs at info/debug, so nothing is written unless you ask
+    #   for it, and the per-frame logging is guarded by isEnabledFor(DEBUG) so a quiet level costs
+    #   nothing on the hot path. Use --log-level info to see pause/resume, tracking loss and every
+    #   emitted click/scroll, or debug for per-frame detail.
+    log_file: str = ""
+    #   Where the JSON-lines log goes. Empty (default) logs to stderr; a path appends to that file.
+    #   Each line is one JSON object with `time`, `level`, `logger`, `event` and the event's fields,
+    #   so a session can be diffed or plotted without parsing prose.

@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "kinematic"
+version = "0.9.0"
+description = "Webcam hand-gesture mouse control: OpenCV + MediaPipe tracking, PyAutoGUI output, and a safety layer that starts paused"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+keywords = ["webcam", "mediapipe", "opencv", "pyautogui", "accessibility", "gestures"]
+classifiers = [
+  "Environment :: MacOS X",
+  "Intended Audience :: End Users/Desktop",
+  "Programming Language :: Python :: 3.9",
+  "Topic :: Multimedia :: Video :: Capture",
+]
+# Keep mediapipe pinned: 0.10.30 and later dropped mp.solutions, which this pipeline uses for hand
+# tracking, so an unpinned install produces an app that imports and then cannot find a hand tracker
+# (AGENTS.md gotcha 8.2). requirements.txt carries the same pin for a plain pip install.
+dependencies = [
+  "numpy",
+  "opencv-python",
+  "mediapipe==0.10.14",
+  "pyautogui",
+]
+
+[project.scripts]
+# Same entry point as `python3 -m kinematic.main`; both invocation styles are supported on purpose
+# (see the __package__ guard at the top of main.py).
+kinematic = "kinematic.main:main"
+
+[project.urls]
+Homepage = "https://github.com/Marvinoponopano/kinematic"
+
+[tool.setuptools]
+packages = ["kinematic"]

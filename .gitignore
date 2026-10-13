@@ -4,5 +4,13 @@ __pycache__/
 .venv/
 venv/
 
+# packaging / build artefacts
+build/
+dist/
+*.egg-info/
+
+# logs
+*.jsonl
+
 # macOS
 .DS_Store

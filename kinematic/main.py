@@ -26,6 +26,9 @@ from typing import Any, Optional
 
 from .capture import ThreadedCamera
 from .config import HandMouseConfig
+from .diagnostics import check_accessibility, diagnose, format_report, report_fields
+from .log import configure as configure_log
+from .log import get_logger, log_event
 from .output import MouseOutput, RecordingMouseOutput
 from .runtime import HandMouseRuntime
 
@@ -168,6 +171,38 @@ def parse_args(argv: Optional[list] = None) -> argparse.Namespace:
         action="store_true",
         help="flip the horizontal scroll direction if it feels backwards",
     )
+    parser.add_argument(
+        "--gesture-pause",
+        action="store_true",
+        help="let a gesture pause the pointer: hold an open hand (all four fingers straight) for --gesture-pause-hold seconds. Off by default",
+    )
+    parser.add_argument(
+        "--gesture-pause-hold",
+        type=float,
+        default=None,
+        help="seconds the open hand must be held before the gesture pause toggles (default 1.2)",
+    )
+    parser.add_argument(
+        "--diagnose",
+        action="store_true",
+        help="check this machine (camera, screen, MediaPipe, permissions) and exit - moves nothing, opens no window",
+    )
+    parser.add_argument(
+        "--no-camera-probe",
+        action="store_true",
+        help="with --diagnose: skip the camera check (it is the only check that turns the camera light on)",
+    )
+    parser.add_argument(
+        "--log-level",
+        choices=("debug", "info", "warning", "error", "critical"),
+        default=None,
+        help="structured (JSON-lines) log level; the pipeline logs at info/debug, so the default warning prints nothing",
+    )
+    parser.add_argument(
+        "--log-file",
+        default=None,
+        help="append the JSON-lines log to this file instead of stderr (one JSON object per line)",
+    )
     return parser.parse_args(argv)
 
 
@@ -207,15 +242,59 @@ def build_config(args: argparse.Namespace) -> HandMouseConfig:
         overrides["scroll_invert_vertical"] = True
     if args.invert_scroll_horizontal:
         overrides["scroll_invert_horizontal"] = True
+    if args.gesture_pause:
+        overrides["gesture_pause_enabled"] = True
+    if args.gesture_pause_hold is not None:
+        overrides["gesture_pause_hold_seconds"] = args.gesture_pause_hold
+    if args.log_level is not None:
+        overrides["log_level"] = args.log_level
+    if args.log_file is not None:
+        overrides["log_file"] = args.log_file
     return HandMouseConfig(**overrides)
+
+
+def run_diagnostics(config: HandMouseConfig, include_camera: bool = True) -> int:
+    """``--diagnose``: check this machine and print the report.
+
+    It never opens the preview window and never moves the pointer; the camera check is the only part
+    that touches hardware and ``--no-camera-probe`` skips it. Exit status is 0 when every check
+    passed, so a script can gate on it.
+    """
+    app = HandMouseApp(config)
+    runtime = app.runtime
+    try:
+        checks = diagnose(
+            config=config,
+            output=runtime.output,
+            hands=runtime.hands,
+            camera=include_camera,
+        )
+    finally:
+        app.close()
+    print(format_report(checks))
+    log_event(get_logger("main"), "diagnostics", **report_fields(checks))
+    return 0 if all(check.ok for check in checks) else 1
 
 
 def main(argv: Optional[list] = None) -> int:
     args = parse_args(argv)
-    app = HandMouseApp(build_config(args))
+    config = build_config(args)
+    # Configure the structured log before anything else, so a session's very first line is logged.
+    configure_log(config.log_level, config.log_file or None)
+
+    if args.diagnose:
+        return run_diagnostics(config, include_camera=not args.no_camera_probe)
+
+    app = HandMouseApp(config)
     runtime = app.runtime
+    logger = get_logger("main")
 
     print(f"kinematic: output={type(runtime.output).__name__} status={runtime.status}")
+    if config.log_level != "warning" or config.log_file:
+        print(
+            f"kinematic: logging level={config.log_level} -> "
+            f"{config.log_file if config.log_file else 'stderr'} (JSON lines)"
+        )
     print(
         f"kinematic: pointer mode={runtime.config.pointer_mode} "
         f"reference={runtime.config.pointer_reference} "
@@ -264,6 +343,14 @@ def main(argv: Optional[list] = None) -> int:
         )
     else:
         print("kinematic: cursor moves not capped (one per frame; --move-max-hz N to cap them)")
+    if runtime.config.gesture_pause_enabled:
+        print(
+            f"kinematic: gesture pause ON - hold an open hand ({runtime.config.gesture_pause_fingers} "
+            f"fingers straight, no pinch) for {runtime.config.gesture_pause_hold_seconds}s to pause or "
+            "resume; SPACE still works"
+        )
+    else:
+        print("kinematic: gesture pause off (--gesture-pause to hold an open hand and pause)")
     if runtime.config.show_last_action:
         print("kinematic: the preview shows the last click/scroll emitted, which is also how the dry run shows it")
     print(
@@ -282,6 +369,25 @@ def main(argv: Optional[list] = None) -> int:
         print("kinematic: paused at startup - press SPACE in the preview window to control the mouse, ESC or q to quit")
     if isinstance(runtime.output, RecordingMouseOutput):
         print("kinematic: dry run - no mouse output will be emitted")
+    else:
+        # Diagnosed *before* the user wonders why nothing moves: without Accessibility on macOS,
+        # pyautogui's calls are silently ignored (AGENTS.md gotcha 8.5), which looks like a bug in
+        # the mapping. Read-only question, and a real adapter is the only case where it matters.
+        access = check_accessibility()
+        if not access.ok:
+            print(f"kinematic: warning - {access.detail}")
+            print(f"kinematic: {access.hint}")
+
+    log_event(
+        logger,
+        "session_start",
+        output=type(runtime.output).__name__,
+        status=runtime.status,
+        dry_run=isinstance(runtime.output, RecordingMouseOutput),
+        sensitivity=runtime.sensitivity,
+        gesture_pause=runtime.config.gesture_pause_enabled,
+        log_level=config.log_level,
+    )
 
     try:
         app.run()
@@ -292,6 +398,11 @@ def main(argv: Optional[list] = None) -> int:
         print(
             f"kinematic: frames={summary['frames']} output_calls={summary['emitted']} "
             f"loop_fps={summary['loop_fps']} status={summary['status']}"
+        )
+        print(
+            f"kinematic: pause toggles={summary['pause_toggles']} "
+            f"(by gesture {summary['gesture_pause_toggles']}, last source {summary['pause_source']}) "
+            f"tracking losses={summary['tracking_losses']}"
         )
         print(
             f"kinematic: sensitivity ended at {summary['sensitivity']} "

@@ -7,11 +7,20 @@ Point = Tuple[float, float]
 WRIST = 0
 THUMB_TIP = 4
 INDEX_MCP = 5
+INDEX_PIP = 6
 INDEX_TIP = 8
 MIDDLE_MCP = 9
+MIDDLE_PIP = 10
 MIDDLE_TIP = 12
 RING_MCP = 13
+RING_PIP = 14
+RING_TIP = 16
 PINKY_MCP = 17
+PINKY_PIP = 18
+PINKY_TIP = 20
+
+#: The four fingers (index → pinky) as (tip, the joint below it), for the extended-finger count.
+FINGER_CHAINS = ((INDEX_TIP, INDEX_PIP), (MIDDLE_TIP, MIDDLE_PIP), (RING_TIP, RING_PIP), (PINKY_TIP, PINKY_PIP))
 
 #: Landmarks averaged for the palm point. The wrist joint and the four knuckles barely
 #: move when the fingers curl or spread — unlike the fingertips, which move a lot.
@@ -199,6 +208,23 @@ def hand_span(landmarks: Sequence[Any]) -> float:
     return max(
         point_distance(landmark_point(landmarks, INDEX_MCP), landmark_point(landmarks, PINKY_MCP)),
         MIN_HAND_SCALE,
+    )
+
+
+def extended_fingers(landmarks: Sequence[Any]) -> int:
+    """How many of the four fingers (index → pinky) are straight rather than curled.
+
+    A finger counts as extended when its tip is farther from the wrist than the joint below it
+    (:data:`FINGER_CHAINS`), which holds for a straight finger and not for a curled one. Deliberately
+    coarse: this feeds the *opt-in* gesture pause (an open hand held for a second, Phase 8) and never
+    the pointer or the pinch geometry, both of which work from the hand's scale instead.
+    """
+    wrist = wrist_point(landmarks)
+    return sum(
+        1
+        for tip, middle in FINGER_CHAINS
+        if point_distance(wrist, landmark_point(landmarks, tip))
+        > point_distance(wrist, landmark_point(landmarks, middle))
     )
 
 
