@@ -525,5 +525,82 @@ class CleanupTests(unittest.TestCase):
         self.assertEqual(before, after, "no capture thread survives a launch/close cycle")
 
 
+class TeardownReleasesHeldButtonsTests(unittest.TestCase):
+    """Every path that ends the run must lift a button a pinch left down.
+
+    A held pinch is a real button held down on the desktop, and each of these paths used to end the
+    process with it still down: quitting with the key, closing the preview window, an exception in the
+    loop, and any caller that only calls ``close()``. The release is idempotent, because ``run()``'s
+    ``finally`` and ``close()`` both run on a normal exit.
+    """
+
+    def _runtime_with_a_held_pinch(
+        self, show_preview: bool = False
+    ) -> Tuple[HandMouseRuntime, RecordingMouseOutput]:
+        output = RecordingMouseOutput()
+        runtime = HandMouseRuntime(
+            config=HandMouseConfig(show_preview=show_preview, start_paused=False),
+            output=output,
+            hands=NoHands(),
+        )
+        feed_gestures(runtime, 3, pinched_hand("index"))
+        self.assertEqual(len(output.clicks), 1, "the pinch must have pressed before teardown")
+        self.assertEqual(output.releases, [], "and must still be held")
+        return runtime, output
+
+    def test_quitting_the_loop_while_pinching_releases_the_button(self):
+        runtime, output = self._runtime_with_a_held_pinch()
+        runtime.handle_key = lambda key: True  # the user hits q/ESC on the first key
+        with mock.patch.object(runtime_module.cv2, "waitKey", lambda ms: -1):
+            runtime.run(camera=FakeCamera(), max_frames=200)
+        self.assertEqual([r.value for r in output.releases], ["left"], "the quit must lift the button")
+
+    def test_closing_the_window_while_pinching_releases_the_button(self):
+        # show_preview matters here: the window-closed check only runs when there is a window.
+        runtime, output = self._runtime_with_a_held_pinch(show_preview=True)
+        with mock.patch.object(runtime_module.cv2, "imshow"), mock.patch.object(
+            runtime_module.cv2, "destroyAllWindows"
+        ), mock.patch.object(runtime_module.cv2, "waitKey", lambda ms: -1), mock.patch.object(
+            runtime_module.cv2, "getWindowProperty", lambda name, prop: 0.0
+        ):
+            runtime.run(camera=FakeCamera(), max_frames=200)
+        self.assertEqual([r.value for r in output.releases], ["left"])
+
+    def test_an_exception_while_pinching_releases_the_button(self):
+        runtime, output = self._runtime_with_a_held_pinch()
+        with mock.patch.object(runtime_module, "ThreadedCamera", lambda **kwargs: FakeCamera(
+            error="Unable to read frames from the webcam."
+        )), mock.patch.object(runtime_module.cv2, "waitKey", lambda ms: -1):
+            with self.assertRaises(RuntimeError):
+                runtime.run()
+        self.assertEqual([r.value for r in output.releases], ["left"])
+
+    def test_close_alone_releases_the_button(self):
+        runtime, output = self._runtime_with_a_held_pinch()
+        runtime.close()
+        self.assertEqual([r.value for r in output.releases], ["left"])
+
+    def test_the_teardown_release_is_idempotent(self):
+        """A normal exit runs both run()'s finally and close(); one press owes exactly one release."""
+        runtime, output = self._runtime_with_a_held_pinch()
+        runtime.handle_key = lambda key: True
+        with mock.patch.object(runtime_module.cv2, "waitKey", lambda ms: -1):
+            runtime.run(camera=FakeCamera(), max_frames=200)
+        runtime.close()
+        runtime.release_held_buttons()
+        self.assertEqual([r.value for r in output.releases], ["left"], "one press, one release")
+        self.assertEqual(len(output.clicks), 1, "and no extra press")
+
+    def test_nothing_is_released_when_no_pinch_is_held(self):
+        output = RecordingMouseOutput()
+        runtime = HandMouseRuntime(
+            config=HandMouseConfig(show_preview=False, start_paused=False),
+            output=output,
+            hands=NoHands(),
+        )
+        runtime.close()
+        self.assertEqual(output.events, [], "a session that never pressed must not release anything")
+
+
 if __name__ == "__main__":
     unittest.main()

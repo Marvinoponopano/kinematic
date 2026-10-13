@@ -559,6 +559,29 @@ class HandMouseRuntime:
         self.emitted += 1
         return 1
 
+    def release_held_buttons(self) -> int:
+        """Lift any mouse button a pinch left down, and return how many releases were sent.
+
+        Every path that ends the run calls this, because a held pinch is a **real button held down on
+        the user's desktop**: on a quit key, a window close, Ctrl-C, an exception, or the process
+        simply ending, nothing else would ever send the matching ``mouseUp`` and the user is left with
+        a stuck button (the drag never ends). Like the other release paths it bypasses ``can_emit`` —
+        cleanup for something already down is not new input-driven output.
+
+        Safe to call more than once (``run()``'s ``finally`` and ``close()`` both do, and a caller may
+        call it again): the recogniser only reports a pair as pressed while it is owed a release, and
+        clearing that state here means the second call sends nothing.
+        """
+        releases = self.gesture.pending_releases()
+        sent = 0
+        for event in releases:
+            sent += self._flush_release(event, time.monotonic())
+        if releases:
+            # Disarm as well as clear: the pose that was held is not re-pressed by the next frame of a
+            # resumed loop until it has been released and pinched again, exactly like a resume.
+            self.gesture.reset(disarm=True)
+        return sent
+
     def _apply_gesture_events(self, update: GestureUpdate, now: Optional[float] = None) -> int:
         emitted = 0
         stamp = time.monotonic() if now is None else float(now)
@@ -898,6 +921,9 @@ class HandMouseRuntime:
                 cam.release()
             if self.config.show_preview:
                 cv2.destroyAllWindows()
+            # Before the loop's own bookkeeping: the loop may be ending *mid-drag*, and a button left
+            # down when the process exits stays down on the real desktop with nothing left to lift it.
+            self.release_held_buttons()
             log_event(
                 self.log,
                 "loop_stop",
@@ -962,6 +988,9 @@ class HandMouseRuntime:
         }
 
     def close(self) -> None:
+        # The last chance to lift a held button: after this the process may exit, and a pinch held
+        # when it did would leave the real mouse stuck down. Idempotent with run()'s own release.
+        self.release_held_buttons()
         log_event(self.log, "summary", **{key: value for key, value in self.summary().items() if key != "recorded"})
         close = getattr(self.hands, "close", None)
         if callable(close):

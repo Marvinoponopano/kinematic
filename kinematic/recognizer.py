@@ -312,9 +312,15 @@ class GestureRecognizer:
             # engaged", and releasing it (returning to a different pose) is what re-arms the gesture,
             # so the two pairs still have to be tracked. No click or scroll logic runs here — only
             # what the pause gesture itself reads.
+            events = list(pause_events)
             if observation.landmarks is not None:
                 self._observe_hand(observation)
-            return GestureUpdate(state=self.state, events=pause_events)
+                # Nothing can be pressed on the way in here (set_paused() collects and releases first),
+                # but the invariant is worth keeping unconditional: the frame that ends a pair's
+                # engagement is the frame that owes its release, whatever the pause state is. Skipping
+                # this is how a stuck button gets introduced by a future path that pauses differently.
+                events.extend(self._check_releases())
+            return GestureUpdate(state=self.state, events=tuple(events))
 
         if observation.landmarks is None:
             if self.state is HandState.TRACKING_LOST:

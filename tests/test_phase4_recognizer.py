@@ -729,6 +729,23 @@ class PressAndHoldTests(unittest.TestCase):
         self.assertEqual(first, second)
         self.assertTrue(recogniser.pressed("thumb_index"), "merely asking must not release anything")
 
+    def test_a_release_still_fires_if_engagement_ends_while_paused(self):
+        """Defensive: the invariant is "the frame that ends the engagement emits the release".
+
+        Reaching this state through the public API is impossible — ``set_paused()`` releases on the way
+        in — so the paused flag is set directly here, standing in for any future path that pauses
+        without going through it. Without the check in the paused branch, such a path would leave
+        ``_pressed`` set and the button down until something else happened to release it.
+        """
+        recogniser = GestureRecognizer()
+        settle(recogniser, hand(thumb_index_ratio=PINCHED), start=0.0)
+        self.assertTrue(recogniser.pressed("thumb_index"))
+        recogniser._paused = True  # deliberately bypassing set_paused()
+        recogniser.state = HandState.PAUSED
+        update, _now = settle(recogniser, hand(thumb_index_ratio=OPEN), start=1.0, frames=1)
+        self.assertEqual(kinds(update.events), ["left_release"])
+        self.assertFalse(recogniser.pressed("thumb_index"))
+
 
 if __name__ == "__main__":
     unittest.main()
