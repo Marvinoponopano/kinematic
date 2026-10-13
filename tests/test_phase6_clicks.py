@@ -500,5 +500,101 @@ class LegacyPinchHelperTests(unittest.TestCase):
         self.assertEqual([click.value for click in output.clicks], ["left"])
 
 
+class PressAndHoldThroughTheAdapterTests(unittest.TestCase):
+    """The bug fix, at the level the user actually hit it: the real output adapter.
+
+    Reported: "when I pinch using my pointer finger, I can't seem to hold down left click. It
+    activates left click, then immediately releases." The runtime used to call
+    ``output.click("left")`` for a pinch, which is an instant down+up — holding the pose longer never
+    kept the real button down. It now calls ``output.press()`` on engage and ``output.release()`` only
+    when the pose actually opens, so a held pinch holds the button and a quick tap still looks like an
+    ordinary click (a press immediately followed by a release).
+    """
+
+    def test_holding_the_pinch_keeps_the_button_down(self):
+        output = RecordingMouseOutput()
+        runtime = make_runtime(output)
+        runtime.resume()
+        now = 0.0
+        for index in range(3):  # clears the hold time
+            now += STEP
+            runtime.process_landmarks(hand(thumb_index_ratio=PINCHED), now=now)
+        self.assertEqual([c.value for c in output.clicks], ["left"], "one press, not a click per frame")
+        self.assertEqual(output.releases, [], "the button must still be down")
+
+        # Hold for a full second of frames: nothing new should fire.
+        for index in range(1, 31):
+            now += FRAME
+            runtime.process_landmarks(hand(thumb_index_ratio=PINCHED), now=now)
+        self.assertEqual(len(output.clicks), 1, "a held pinch must not re-press")
+        self.assertEqual(output.releases, [], "the button must still be down after a full second")
+
+        # Release the pinch: exactly one release, nothing else.
+        now += FRAME
+        runtime.process_landmarks(hand(thumb_index_ratio=OPEN), now=now)
+        self.assertEqual(len(output.clicks), 1)
+        self.assertEqual([r.value for r in output.releases], ["left"])
+
+    def test_a_quick_tap_presses_and_releases_right_away(self):
+        """A fast pinch-and-release reaches the adapter as a press immediately followed by a release —
+        visually indistinguishable from the old one-shot click on the real desktop."""
+        output = RecordingMouseOutput()
+        runtime = make_runtime(output)
+        runtime.resume()
+        now = 0.0
+        for index in range(3):
+            now += STEP
+            runtime.process_landmarks(hand(thumb_index_ratio=PINCHED), now=now)
+        now += FRAME
+        runtime.process_landmarks(hand(thumb_index_ratio=OPEN), now=now)
+        self.assertEqual([c.value for c in output.clicks], ["left"])
+        self.assertEqual([r.value for r in output.releases], ["left"])
+
+    def test_pausing_mid_hold_releases_the_real_button(self):
+        """Pressing SPACE while a pinch is held must not leave the real button stuck down."""
+        output = RecordingMouseOutput()
+        runtime = make_runtime(output)
+        runtime.resume()
+        now = 0.0
+        for index in range(3):
+            now += STEP
+            runtime.process_landmarks(hand(thumb_index_ratio=PINCHED), now=now)
+        self.assertEqual(len(output.clicks), 1)
+        self.assertEqual(output.releases, [])
+        runtime.pause()
+        self.assertEqual([r.value for r in output.releases], ["left"], "the pause itself must release it")
+
+    def test_right_pinch_also_holds_and_releases(self):
+        output = RecordingMouseOutput()
+        runtime = make_runtime(output)
+        runtime.resume()
+        now = 0.0
+        for index in range(3):
+            now += STEP
+            runtime.process_landmarks(hand(thumb_middle_ratio=PINCHED), now=now)
+        self.assertEqual([c.value for c in output.clicks], ["right"])
+        self.assertEqual(output.releases, [])
+        now += FRAME
+        runtime.process_landmarks(hand(thumb_middle_ratio=OPEN), now=now)
+        self.assertEqual([r.value for r in output.releases], ["right"])
+
+    def test_counts_are_unaffected_a_press_still_counts_as_a_click(self):
+        """``counts()`` only ever reported move/click/scroll; a release must not appear in it, so
+        every existing exact-count assertion elsewhere in this suite keeps meaning what it always
+        meant."""
+        output = RecordingMouseOutput()
+        runtime = make_runtime(output)
+        runtime.resume()
+        now = 0.0
+        for index in range(3):
+            now += STEP
+            runtime.process_landmarks(hand(thumb_index_ratio=PINCHED), now=now)
+        now += FRAME
+        runtime.process_landmarks(hand(thumb_index_ratio=OPEN), now=now)
+        counts = output.counts()
+        self.assertEqual(counts["click"], 1)
+        self.assertNotIn("release", counts)
+
+
 if __name__ == "__main__":
     unittest.main()

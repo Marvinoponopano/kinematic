@@ -42,6 +42,22 @@ class MouseOutput:
     def click(self, button: str = "left") -> None:
         raise NotImplementedError
 
+    def press(self, button: str = "left") -> None:
+        """Press a mouse button down and hold it (no matching release yet).
+
+        This is what makes a held pinch able to drag: :meth:`click` is a single down+up
+        event, so holding the pinch after a ``click()`` never kept the button down. The
+        recogniser now calls ``press``/`:meth:`release` instead for the default engine's
+        left/right pinch, so a quick pinch-and-release still looks like an ordinary click
+        (press immediately followed by release) while a held pinch keeps the button down
+        for as long as the pose is held.
+        """
+        raise NotImplementedError
+
+    def release(self, button: str = "left") -> None:
+        """Release a button a prior :meth:`press` left down."""
+        raise NotImplementedError
+
     def scroll(self, amount: int, x: Optional[float] = None, y: Optional[float] = None) -> None:
         """Vertical wheel scroll: positive scrolls up, negative scrolls down."""
         raise NotImplementedError
@@ -89,6 +105,12 @@ class RealMouseOutput(MouseOutput):
     def click(self, button: str = "left") -> None:
         self._pyautogui.click(button=button)
 
+    def press(self, button: str = "left") -> None:
+        self._pyautogui.mouseDown(button=button)
+
+    def release(self, button: str = "left") -> None:
+        self._pyautogui.mouseUp(button=button)
+
     def scroll(self, amount: int, x: Optional[float] = None, y: Optional[float] = None) -> None:
         self._pyautogui.scroll(amount, x=x, y=y)
 
@@ -125,6 +147,18 @@ class RecordingMouseOutput(MouseOutput):
     def click(self, button: str = "left") -> None:
         self.events.append(MouseEvent("click", button, time.monotonic()))
 
+    def press(self, button: str = "left") -> None:
+        """Recorded as a ``"click"`` event too: a tap is a press immediately followed by a
+        release, so every existing count of ``clicks``/``counts()["click"]`` still means
+        "the mouse was clicked (or drag-pressed) this many times" without a test needing to
+        tell press and the old one-shot click apart."""
+        self.events.append(MouseEvent("click", button, time.monotonic()))
+
+    def release(self, button: str = "left") -> None:
+        """A separate ``"release"`` kind, deliberately left out of :meth:`counts` (which
+        only ever reported move/click/scroll) so no existing exact-count assertion changes."""
+        self.events.append(MouseEvent("release", button, time.monotonic()))
+
     def scroll(self, amount: int, x: Optional[float] = None, y: Optional[float] = None) -> None:
         self.events.append(MouseEvent("scroll", int(amount), time.monotonic(), axis="vertical"))
 
@@ -141,6 +175,11 @@ class RecordingMouseOutput(MouseOutput):
     @property
     def clicks(self) -> List[MouseEvent]:
         return self.of_kind("click")
+
+    @property
+    def releases(self) -> List[MouseEvent]:
+        """Every button-up from a held :meth:`press` (never from the legacy one-shot :meth:`click`)."""
+        return self.of_kind("release")
 
     @property
     def scrolls(self) -> List[MouseEvent]:

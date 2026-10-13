@@ -38,6 +38,7 @@ from .gesture import (
     THUMB_TIP,
 )
 from .mapping import Region, map_point_to_screen
+from .log import get_logger, log_event
 from .output import MouseOutput, RealMouseOutput, RecordingMouseOutput
 from .ratelimit import MoveRateLimiter, ScrollRateLimiter
 from .recognizer import (
@@ -50,6 +51,11 @@ from .recognizer import (
     thresholds_from_config,
 )
 from .smoothing import CursorFilter, filter_from_config
+
+#: How often the loop writes its periodic ``frame`` heartbeat, in processed frames: one line per
+#: second at 30 fps. Enough to follow a session, few enough that the log cannot become the second
+#: thing the loop waits on — and the line is dropped entirely at any level below debug (see log.py).
+FRAME_LOG_INTERVAL = 30
 
 
 class HandMouseRuntime:
@@ -97,6 +103,16 @@ class HandMouseRuntime:
         self.emitted = 0
         self.paused = bool(self.config.start_paused)
 
+        # Phase 8/9: who last changed the pause state (startup, key, gesture or the API), how many
+        # times, and how often tracking was lost — the counters a session report is made of.
+        self.pause_source = "startup"
+        self.pause_toggles = 0
+        self.gesture_pause_toggles = 0
+        self.tracking_losses = 0
+        # Phase 9: structured logging, quiet unless the level says otherwise (see log.py). The
+        # per-call guard lives in log_event, so a warning-level session pays nothing per frame.
+        self.log = get_logger("runtime")
+
         # Phase 4: the pure recogniser owns gesture state; the runtime only translates events.
         self.gesture = GestureRecognizer(thresholds_from_config(self.config))
         self.gesture.set_paused(self.paused)
@@ -143,20 +159,27 @@ class HandMouseRuntime:
     def status(self) -> str:
         return "paused" if self.paused else "active"
 
-    def pause(self) -> bool:
+    def pause(self, source: str = "api") -> bool:
+        """Stop emitting output. ``source`` records who did it (key, gesture, api) for the log."""
         self.paused = True
+        self.pause_source = source
         self._sync_gesture_pause()
+        log_event(self.log, "pause", source=source, frames=self.frames)
         return self.paused
 
-    def resume(self) -> bool:
+    def resume(self, source: str = "api") -> bool:
+        """Allow output again. Idempotent: resuming an unpaused runtime changes nothing."""
         self.paused = False
+        self.pause_source = source
         self._sync_gesture_pause()
+        log_event(self.log, "resume", source=source, frames=self.frames)
         return self.paused
 
-    def toggle_pause(self) -> bool:
-        self.paused = not self.paused
-        self._sync_gesture_pause()
-        return self.paused
+    def toggle_pause(self, source: str = "api") -> bool:
+        self.pause_toggles += 1
+        if self.paused:
+            return self.resume(source=source)
+        return self.pause(source=source)
 
     def _sync_gesture_pause(self) -> None:
         """Tell the recogniser about a pause/resume so its state machine stays truthful.
@@ -164,11 +187,18 @@ class HandMouseRuntime:
         The recogniser drops any gesture in flight here, which is what stops a pinch held
         across a resume from clicking — the rising edge belonged to the paused period.
         """
-        self.gesture.set_paused(self.paused)
+        events = self.gesture.set_paused(self.paused)
         self.gesture_state = self.gesture.state
         # A pause/resume ends any scroll in flight (the recogniser says so), so the scroll limiter's
         # accumulated remainder goes with it: it belongs to movement that is over.
         self.scroll_limiter.reset()
+        # set_paused() can also return a release for a pinch that was mid-drag when the pause landed —
+        # unlike a click, that release must always reach the desktop (a button left "down" when the
+        # user pauses is a real stuck button on their machine), so it bypasses can_emit the same way
+        # the equivalent path in _apply_gesture_events does.
+        for event in events:
+            if event.kind in (EventKind.LEFT_RELEASE, EventKind.RIGHT_RELEASE):
+                self._flush_release(event, time.monotonic())
 
     def handle_key(self, key: int) -> bool:
         """Act on a ``cv2.waitKey()`` code. Returns True when the loop should stop."""
@@ -176,7 +206,7 @@ class HandMouseRuntime:
             return False
         char = chr(key & 0xFF)
         if char in self.config.toggle_pause_keys:
-            self.toggle_pause()
+            self.toggle_pause(source="key")
             return False
         if char in self.config.sensitivity_keys_up:
             self.adjust_sensitivity(1)
@@ -317,6 +347,14 @@ class HandMouseRuntime:
         # tools/measure_smoothness.py's notes, so there is no usable per-frame tween on this stack.
         self.output.move_to(self.cursor_x, self.cursor_y, duration=0)
         self.emitted += 1
+        log_event(
+            self.log,
+            "move",
+            level="debug",
+            x=round(self.cursor_x, 1),
+            y=round(self.cursor_y, 1),
+            frames=self.frames,
+        )
         return True
 
     # -- Phase 6: last-action status ------------------------------------------
@@ -508,18 +546,47 @@ class HandMouseRuntime:
         self.last_gesture_events = update.events
         return self._apply_gesture_events(update, now=now)
 
+    def _flush_release(self, event: GestureEvent, stamp: float) -> int:
+        """Send one LEFT_RELEASE/RIGHT_RELEASE straight to the adapter. Returns calls made (0 or 1).
+
+        Pulled out of :meth:`_apply_gesture_events` so :meth:`_sync_gesture_pause` can reuse the exact
+        same call (adapter + logging), since a pause/resume can also surface a release that has to
+        reach the desktop regardless of ``can_emit``.
+        """
+        button = "left" if event.kind is EventKind.LEFT_RELEASE else "right"
+        self.output.release(button)
+        log_event(self.log, "release", kind=button)
+        self.emitted += 1
+        return 1
+
     def _apply_gesture_events(self, update: GestureUpdate, now: Optional[float] = None) -> int:
         emitted = 0
         stamp = time.monotonic() if now is None else float(now)
         for event in update.events:
+            if event.kind is EventKind.PAUSE_TOGGLE:
+                # Deliberately checked *before* the can_emit gate: this event is what moves the gate
+                # (it is the gesture form of the SPACE key), and it emits nothing to the desktop.
+                # toggle_pause() writes the pause/resume log line itself, with source="gesture".
+                self.gesture_pause_toggles += 1
+                self.toggle_pause(source="gesture")
+                continue
+            if event.kind in (EventKind.LEFT_RELEASE, EventKind.RIGHT_RELEASE):
+                # Also checked before the can_emit gate: a release is cleanup for a button a prior
+                # press left down, never new input-driven output, so it must go out even on the exact
+                # frame that also pauses (a pause toggle earlier in this same batch can already have
+                # flipped can_emit to False) — otherwise the real button is left stuck down.
+                emitted += self._flush_release(event, stamp)
+                continue
             if not self.can_emit:
                 break
             if event.kind is EventKind.LEFT_CLICK:
-                self.output.click("left")
+                self.output.press("left")
                 self._record_action("left click", stamp)
+                log_event(self.log, "click", kind="left", action=self.last_action)
             elif event.kind is EventKind.RIGHT_CLICK:
-                self.output.click("right")
+                self.output.press("right")
                 self._record_action("right click", stamp)
+                log_event(self.log, "click", kind="right", action=self.last_action)
             elif event.kind is EventKind.SCROLL:
                 emitted += self.emit_scroll(event, stamp)
                 continue
@@ -530,10 +597,21 @@ class HandMouseRuntime:
                 continue
             else:
                 # scroll_begin, tracking and pause events are state bookkeeping.
+                self._log_bookkeeping(event)
                 continue
             self.emitted += 1
             emitted += 1
         return emitted
+
+    def _log_bookkeeping(self, event: GestureEvent) -> None:
+        """Log the informational gesture events, and count the tracking losses for the summary."""
+        if event.kind is EventKind.TRACKING_LOST:
+            self.tracking_losses += 1
+            log_event(self.log, "tracking_lost", frames=self.frames, losses=self.tracking_losses)
+        elif event.kind is EventKind.TRACKING_RESTORED:
+            log_event(self.log, "tracking_restored", frames=self.frames, losses=self.tracking_losses)
+        elif event.kind is EventKind.SCROLL_BEGIN:
+            log_event(self.log, "scroll_begin", level="debug", frames=self.frames)
 
     def emit_scroll(self, event: GestureEvent, now: Optional[float] = None) -> int:
         """Send one SCROLL event on both wheel axes, through the scroll rate limiter.
@@ -565,6 +643,7 @@ class HandMouseRuntime:
         if calls:
             self._record_action("scroll", now)
             self.emitted += calls
+            log_event(self.log, "scroll", vertical=vertical, horizontal=horizontal)
         return calls
 
     def process_landmarks(self, landmarks, now: Optional[float] = None) -> int:
@@ -739,6 +818,20 @@ class HandMouseRuntime:
                 buffer_size=self.config.capture_buffer_size,
             )
 
+        log_event(
+            self.log,
+            "loop_start",
+            pointer_mode=self.config.pointer_mode,
+            pointer_reference=self.config.pointer_reference,
+            gesture_engine=self.config.gesture_engine,
+            smoothing_mode=self.config.smoothing_mode,
+            sensitivity=self.sensitivity,
+            move_max_hz=self.move_limiter.max_hz,
+            scroll_max_hz=self.scroll_limiter.max_hz,
+            output=type(self.output).__name__,
+            status=self.status,
+        )
+
         try:
             if not cam.wait_ready():
                 raise RuntimeError("Unable to read frames from the webcam.")
@@ -770,20 +863,67 @@ class HandMouseRuntime:
                     processed = 0
                     fps_at = now
 
+                if self.frames % FRAME_LOG_INTERVAL == 0:
+                    # Periodic, never per frame: at info this is a heartbeat, and log_event drops it
+                    # entirely at the default warning level.
+                    log_event(
+                        self.log,
+                        "frame",
+                        level="debug",
+                        frames=self.frames,
+                        loop_fps=round(self.loop_fps, 2),
+                        emitted=self.emitted,
+                        gesture_state=str(self.gesture_state),
+                    )
+
                 if self.config.show_preview:
                     cv2.imshow(self.config.window_name, self.draw_preview(frame, cam))
+                    if not self.window_is_open():
+                        # The user closed the window: exit the loop like a quit key would, so the
+                        # camera is released and the analysis stops instead of running unseen.
+                        log_event(self.log, "window_closed", frames=self.frames)
+                        break
 
                 if self.handle_key(cv2.waitKey(1) & 0xFF):
                     break
                 if max_frames is not None and self.frames >= max_frames:
                     break
+        except BaseException as exc:
+            # Logged, then re-raised: the caller's handling (and the cleanup below) is unchanged, and
+            # a session that ended badly leaves a machine-readable reason behind.
+            log_event(self.log, "loop_error", level="error", error=repr(exc), frames=self.frames)
+            raise
         finally:
             if owned:
                 cam.release()
             if self.config.show_preview:
                 cv2.destroyAllWindows()
+            log_event(
+                self.log,
+                "loop_stop",
+                frames=self.frames,
+                loop_fps=round(self.loop_fps, 2),
+                emitted=self.emitted,
+                status=self.status,
+            )
 
     # -- reporting / teardown -------------------------------------------------
+
+    def window_is_open(self) -> bool:
+        """True while the preview window is still on screen (Phase 8: cleanup on window close).
+
+        Clicking the window's close box leaves OpenCV's loop happily analysing frames nobody can see
+        and holding the camera, so the loop asks whether the window is still visible. Backends differ
+        in what they return for a window that was never created (0, -1, or an exception), so anything
+        unexpected counts as *open*: a missed close is a papercut, a spurious quit is a bug.
+        """
+        get = getattr(cv2, "getWindowProperty", None)
+        if not callable(get):
+            return True
+        try:
+            return float(get(self.config.window_name, cv2.WND_PROP_VISIBLE)) >= 1.0
+        except Exception:
+            return True
 
     def summary(self) -> dict:
         counts = self.output.counts() if isinstance(self.output, RecordingMouseOutput) else {}
@@ -811,9 +951,18 @@ class HandMouseRuntime:
             "scroll_horizontal_gain": self.config.scroll_horizontal_gain,
             "scroll_invert_vertical": self.config.scroll_invert_vertical,
             "scroll_invert_horizontal": self.config.scroll_invert_horizontal,
+            # Phase 8/9: the pause story (who changed it, how often) and how often tracking dropped,
+            # which is what the repeated-launch and sustained-gesture regression checks read.
+            "pause_source": self.pause_source,
+            "pause_toggles": self.pause_toggles,
+            "gesture_pause_toggles": self.gesture_pause_toggles,
+            "gesture_pause_enabled": self.config.gesture_pause_enabled,
+            "tracking_losses": self.tracking_losses,
+            "log_level": self.config.log_level,
         }
 
     def close(self) -> None:
+        log_event(self.log, "summary", **{key: value for key, value in self.summary().items() if key != "recorded"})
         close = getattr(self.hands, "close", None)
         if callable(close):
             close()

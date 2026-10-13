@@ -340,7 +340,7 @@ def main() -> int:
 
     here = pyautogui.position()
     real_move_to = pyautogui.moveTo
-    calls = {"move": 0, "click": 0, "scroll": 0, "hscroll": 0}
+    calls = {"move": 0, "click": 0, "release": 0, "scroll": 0, "hscroll": 0}
     travel: List[float] = []  # distance of each requested cursor move, in pixels
     previous_point: List[Tuple[float, float]] = []
     reached: Dict[str, List[float]] = {"x": [], "y": []}  # every requested coordinate, for the sweep
@@ -367,10 +367,21 @@ def main() -> int:
         calls["hscroll"] += 1
         hscroll_amounts.append(int(amount))
 
+    def counted_press(button="left", **kwargs):
+        # A held pinch presses the button and a quick tap presses-then-releases, so a press is what a
+        # click *is* now; counting it as "click" keeps every verdict below reading the same way, and
+        # counting the release separately is what lets the run end knowing nothing was left down.
+        calls["click"] += 1
+
+    def counted_release(button="left", **kwargs):
+        calls["release"] += 1
+
     pyautogui.moveTo = counted_move_to
     pyautogui.click = lambda *a, **k: calls.__setitem__("click", calls["click"] + 1)
     pyautogui.scroll = counted_scroll
     pyautogui.hscroll = counted_hscroll
+    pyautogui.mouseDown = counted_press
+    pyautogui.mouseUp = counted_release
 
     overrides = {"show_preview": args.preview, "start_paused": not args.active}
     if args.pointer_mode is not None:
@@ -509,6 +520,15 @@ def main() -> int:
             print(f"click verdict    : {'ok' if ok else 'CHECK'} for the legacy engine "
                   f"({clicks} clicks for {taps} taps: its left and right tests can both fire on one pose)")
         print(f"gesture counts   : last action {app.last_action!r}, {app.actions()}")
+    if app.config.gesture_engine == "recognizer" and calls["click"] != calls["release"]:
+        # Only meaningful for the recogniser, whose presses and releases are separate calls: a legacy
+        # ``click()`` is a down+up in one call, so it would false-positive here. An imbalance means a
+        # pinch was still held when the run ended, or a release went missing — worth saying out loud,
+        # because on a real adapter that is a mouse button left down.
+        print(
+            f"button state     : WARNING - {calls['click']} presses vs {calls['release']} releases "
+            f"(a button may still be down)"
+        )
     if args.synthetic_scroll:
         # Phase 7's direction check: a controlled straight-line sweep at a known amplitude, with the
         # wheel calls intercepted, so the sign on each axis can be checked without scrolling anything.

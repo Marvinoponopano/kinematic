@@ -1,7 +1,7 @@
 # AGENTS.md — Kinematic (webcam hand mouse)
 
 Context file for AI coding agents working in this repo. Read this before touching code.
-Last updated: 2026-10-10 (Phases 1–4 of the roadmap complete — see §2 "Phase status" and §5).
+Last updated: 2026-10-11 (all nine phases implemented; Phases 8 and 9 finished today — see §2 "Phase status" and §5).
 
 > If your tool looks for a different filename (`CLAUDE.md`, `.cursorrules`, `.windsurfrules`,
 > `.github/copilot-instructions.md`), copy or symlink this file to that name — the content is
@@ -31,6 +31,7 @@ kinematic/
 ├── .gitignore
 ├── AGENTS.md
 ├── README.md
+├── pyproject.toml         # Phase 9: packaging (setuptools, the `kinematic` console script, the mediapipe pin)
 ├── requirements.txt
 ├── kinematic/
 │   ├── __init__.py        # re-exports HandMouseConfig, is_pinch, is_right_click_gesture, smooth_point
@@ -42,7 +43,9 @@ kinematic/
 │   ├── mapping.py         # Region + map_point_to_screen (frame region -> screen region)
 │   ├── output.py          # MouseOutput adapters: RealMouseOutput / RecordingMouseOutput (mock)
 │   ├── preview.py         # landmark skeleton drawing for the debug preview (drawn with cv2, no protobuf)
-│   ├── ratelimit.py       # Phase 5: MoveRateLimiter — cap/coalesce cursor moves (off by default)
+│   ├── ratelimit.py       # Phase 5/7: MoveRateLimiter (supersede) + ScrollRateLimiter (accumulate)
+│   ├── log.py             # Phase 9: JSON-lines logging (configure/get_logger/log_event), silent by default
+│   ├── diagnostics.py     # Phase 9: checks for camera, screen, MediaPipe, Accessibility, configuration
 │   ├── recognizer.py      # Phase 4: the pure gesture state machine (states, relative thresholds,
 │   │                      #   hysteresis, hold/cooldown/re-arm, scroll priority, event list)
 │   ├── runtime.py         # HandMouseRuntime: pipeline coordinator + the pause gate on all output
@@ -65,15 +68,26 @@ kinematic/
     ├── test_preview_orientation.py # 18 cases: the preview flip modes and the skeleton landing on the hand
     ├── test_sensitivity_dial.py  # 38 cases: the pointer-gain dial, its keys, its bar, its wiring
     ├── test_pointer_modes.py     # 21 cases: absolute is the default, every edge reachable, the reach floor
-    └── test_pointer_reference.py # 21 cases: wrist/palm reference, curl must not move the cursor, scroll guard
+    ├── test_pointer_reference.py # 21 cases: wrist/palm reference, curl must not move the cursor, scroll guard
+    ├── test_phase8_runtime.py    # 31 cases: the open-hand gesture pause, toggle idempotence, recovery
+    │                             #   after a failed run, cleanup on exit / window close / exception
+    ├── test_phase9_diagnostics.py # 31 cases: camera/permission/screen/MediaPipe checks, the report,
+    │                             #   and the --diagnose CLI path (exit status, --no-camera-probe)
+    ├── test_phase9_logging.py    # 18 cases: JSON-lines format, level handling, file logging, no
+    │                             #   per-frame lines at info, the runtime's own events
+    └── test_phase9_e2e.py        # 19 cases: fresh setup, denied permissions, unavailable camera, low light,
+                                  #   partial tracking, sustained gestures, repeated launch/cleanup, and a
+                                  #   call-by-call replay of a scripted session
 tools/
 ├── compare_smoothing.py         # seeded jitter-vs-lag comparison of the cursor filters
 ├── gesture_trace.py             # scripted poses through the recogniser: transition table, no camera
 ├── measure_loop.py              # measure the loop rate with the mouse intercepted (nothing moves),
 │                                #   count clicks per synthetic tap, --move-max-hz / --mouse-pause
 ├── measure_stability.py         # per-frame wrist/palm jitter vs pointer_deadzone (no output adapter at all)
-└── measure_smoothness.py        # held frames / step size / trailing of the emitted cursor (no camera, no mouse),
-                                 #   plus --rate-sweep for the move_max_hz trade-off
+├── measure_smoothness.py        # held frames / step size / trailing of the emitted cursor (no camera, no mouse),
+│                                #   plus --rate-sweep for the move_max_hz trade-off
+└── profile_loop.py              # Phase 9: per-stage ms of a frame (capture/flip/rgb/mediapipe/output/preview),
+                                 #   --cprofile, --mouse-pause; mouse calls intercepted, nothing moves
 ```
 
 Git: published as a private repo, `origin` = `github.com/Marvinoponopano/kinematic`, branch `main`.
@@ -110,6 +124,12 @@ python3 tools/measure_loop.py --synthetic-hand --active --mouse-pause 0.1 --move
 python3 tools/measure_loop.py --synthetic-hand --active --synthetic-scroll vertical --frames 150   # scroll direction
 python3 tools/measure_loop.py --synthetic-hand --active --synthetic-scroll diagonal --scroll-max-hz 4  # the cap, accumulating
 python3 -m kinematic.main --preview-flip none          # preview exactly as the camera delivers it (default: horizontal)
+python3 -m kinematic.main --diagnose                   # camera/screen/MediaPipe/Accessibility report, then exit
+python3 -m kinematic.main --diagnose --no-camera-probe  # same, without turning the camera light on
+python3 -m kinematic.main --gesture-pause              # hold an open hand for 1.2 s to pause/resume
+python3 -m kinematic.main --log-level info --log-file run.jsonl   # structured session log (JSON lines)
+python3 tools/profile_loop.py --active                 # where a frame's milliseconds go (mouse intercepted)
+python3 tools/profile_loop.py --synthetic-hand --active --cprofile 20   # no camera, plus a cProfile dump
 ```
 
 ### Verified interpreter / dependency facts
@@ -643,6 +663,173 @@ takes the sign from Quartz, and finding out what an app does with it would mean 
 screen. So the convention is documented (hand right → positive) and `scroll_invert_horizontal` is the
 one-field fix; the README's manual test says to check it and flip that field if it feels backwards.
 
+### Pinch press-and-hold: hold to drag (fixed 2026-10-11)
+
+Reported: "when I pinch using my pointer finger, I can't seem to hold down left click. It activates
+left click, then immediately releases." The cause: `runtime._apply_gesture_events()` turned a
+`LEFT_CLICK`/`RIGHT_CLICK` event into `output.click("left"/"right")`, and `click()` is pyautogui's
+`mouseDown()` + `mouseUp()` back to back — there was never a code path that kept the button down while
+the pinch was held, so holding the pose longer than an instant did nothing extra and dragging was
+impossible.
+
+**Fixed by splitting the click into a press and a release**, deliberately tied to different things:
+
+- **The press is still debounced exactly as before** — `LEFT_CLICK`/`RIGHT_CLICK` fire once, gated by
+  `pinch_ratio`/hysteresis/`hold_seconds`/`cooldown_seconds`/`require_neutral_between`, unchanged. The
+  runtime now calls `output.press(button)` (pyautogui's bare `mouseDown`) instead of `click()`.
+- **The release is tied to the raw engagement flag, not to the state machine.** A new
+  `GestureRecognizer._check_releases()` runs right after `_observe_hand()` every frame and fires
+  `LEFT_RELEASE`/`RIGHT_RELEASE` the instant `_engaged[pair]` goes false for a pair that is
+  `_pressed[pair]`, deliberately bypassing hold time, cooldown and "no gesture switch without neutral" —
+  those rules debounce when a *press* may re-arm, and tying a release to them risks a stuck button (e.g.
+  the thumb crossing from the index tip straight to the middle tip inside one frame would otherwise be
+  blocked by `require_neutral_between`, leaving the left button "held" by the state machine's bookkeeping
+  after the index pinch was physically already gone).
+- **Pause and tracking loss also force a release.** `GestureRecognizer.pending_releases()` reports what is
+  currently pressed without mutating anything; `set_paused()` and the tracking-lost branch of `update()`
+  call it *before* `reset()` (which clears `_engaged`/`_pressed`, dropping the information a release is
+  owed from) and splice the result into the events they return.
+- **The runtime never lets a release be silently dropped.** `_apply_gesture_events()` handles
+  `LEFT_RELEASE`/`RIGHT_RELEASE` *before* the `can_emit` gate — the same placement as `PAUSE_TOGGLE`,
+  because a release is cleanup for a button already down, not new input-driven output; the case that
+  matters is a pause landing on the same frame the pinch releases. `_sync_gesture_pause()` used to discard
+  `set_paused()`'s return value outright (harmless while those events were only `PAUSED`/`RESUMED`
+  bookkeeping); it now flushes any release through the same `_flush_release()` helper
+  `_apply_gesture_events` uses, so pausing mid-drag — SPACE key, API, or the gesture pause — releases the
+  real button instead of leaving it down.
+- **Recorded as a click, so nothing else in the suite changed.** `RecordingMouseOutput.press()` appends a
+  `"click"` kind event rather than a new kind, so every existing `counts()["click"]`/`.clicks` assertion
+  in the whole suite still means what it meant before. `release()` appends a new `"release"` kind,
+  deliberately left out of `counts()` (which only ever reported move/click/scroll) so no existing
+  exact-dict assertion changed. `last_action`/`action_counts` are untouched by a release, for the same
+  reason.
+
+**Net effect**: a quick pinch-and-release reaches the adapter as a press immediately followed by a
+release — on the real desktop, indistinguishable from the old click. A held pinch keeps the button down
+for as long as the pose is held, which is what makes click-and-drag possible. Verified both at the
+recogniser level (hold for 30 synthetic frames → zero extra events, release → exactly one `left_release`)
+and through the real output adapter via `runtime.process_landmarks()` —
+`tests/test_phase6_clicks.py`'s `PressAndHoldThroughTheAdapterTests` (hold, tap, right pinch, the pause
+path) and `tests/test_phase4_recognizer.py`'s `PressAndHoldTests` (the pure state machine: pausing
+mid-hold, tracking loss mid-hold, cooldown never blocking a release, no re-press while held).
+
+### The gesture pause (Phase 8, finished 2026-10-11)
+
+The phase's fifth bullet is conditional — "add a gesture pause only after the keyboard control is
+reliable" — and it landed as an **opt-in** pose in the recogniser, because Phase 8's own ordering was
+the right one: the keyboard pause had already been proven by four phases of tests.
+
+* **The pose**: an *open hand* — `pause_gesture_fingers` (4) of the four fingers straight, and no pinch
+  pair engaged. `gesture.extended_fingers()` is the coarse test behind it: a finger counts as straight
+  when its tip is farther from the wrist than the joint below it. No click pose can look like it (both
+  pinches have the index or the middle curled).
+* **Hold-gated**: `gesture_pause_hold_seconds` (1.2 s) must elapse. The hold is what makes it safe: the
+  hand passes *through* open shapes constantly on its way to a pinch, and a brief stretch must not stop
+  the mouse.
+* **One toggle per hold**, released to re-arm (`PAUSE_TOGGLE` event, `_pause_armed`), exactly like the
+  click pairs. A hold in flight when a pause/resume arrives from elsewhere (the SPACE key, the API) is
+  cancelled *and* disarmed, or the same continuing hold would toggle straight back a second later.
+* **It works while paused**, which is the only way the same pose can resume: `update()` evaluates the
+  pause pose *before* its `PAUSED` early-return, and the runtime handles `PAUSE_TOGGLE` *before* the
+  `can_emit` gate — because that event is what moves the gate. It reaches no mouse call, so a gesture
+  pause emits nothing.
+* **Off by default** (`gesture_pause_enabled = False`, `--gesture-pause`): a pose that can freeze the
+  pointer has to be a deliberate choice.
+
+Evidence: `tests/test_phase8_runtime.py` (31 cases: the hold, the flicker restart, the re-arm, the
+engaged-pinch refusal, the configurable finger count, working while paused, a hold across a transition,
+and the runtime-side toggles with nothing emitted), plus Phase 8's own missing tests — toggle
+idempotence (`pause()`/`resume()`/`toggle_pause()` twice, from the API and from the keyboard),
+recovery after a failed run, cleanup on a normal exit, on a window close and on an exception, and three
+launch/close cycles leaving no capture thread behind.
+
+**Window close is now a real exit** (it was Phase 8's third cleanup case with no code behind it): the
+loop asks `cv2.getWindowProperty(window, WND_PROP_VISIBLE)` after each `imshow` and treats "not visible
+anymore" as a quit, so clicking the close box stops the analysis and releases the camera instead of
+leaving the loop running unseen. A backend that cannot answer the question is treated as *open* — a
+missed close is a papercut, a spurious exit is a bug.
+
+### Diagnostics, logging and profiling (Phase 9, finished 2026-10-11)
+
+Three new pieces, all additive:
+
+1. **`diagnostics.py` + `--diagnose`.** Checks the platform/interpreter, that MediaPipe imports *and*
+   processes a frame through the legacy `mp.solutions.hands`, which adapter this run would use, the
+   screen size, the macOS Accessibility grant, the effective configuration, and (unless
+   `--no-camera-probe`) that the camera opens and delivers a frame — reporting resolution, how long the
+   first frame took, mean brightness (a `very dark` hint below 30/255) and whether a hand was in view.
+   It touches nothing: the Accessibility answer is `AXIsProcessTrusted()` through ctypes (a read-only
+   question — **no test move of the pointer, no prompt**), and the camera probe releases the device
+   immediately. A permission denial and a missing device get *different* hints. Exit status is 0 only
+   when every check passed, so a script can gate on it. Every check takes an injectable probe
+   (`opener=`, `hands=`, `trusted=`) which is what makes the denied cases testable at all.
+   The app also runs the Accessibility check at startup when the adapter is real, so a missing grant is
+   a sentence rather than "the cursor does not move" (gotcha 8.5).
+2. **`log.py` + `--log-level`/`--log-file`.** One JSON object per line, named events, fields merged in
+   (`event` is the API: `session_start`, `loop_start`/`loop_stop`/`loop_error`, `pause`/`resume` with
+   `source`, `tracking_lost`/`tracking_restored`, `click`, `scroll`, `window_closed`, `summary`, and at
+   debug only `frame`/`move`). Silent unless asked: the default level is `warning` and the pipeline
+   speaks at info/debug; the library adds a `NullHandler` at import (gotcha 8.19), `configure()` replaces
+   handlers rather than stacking them, and `logger.propagate = False` keeps a host app's root config
+   from duplicating the lines. **Logging must not become the second thing the camera-bound loop waits
+   on**: the per-frame heartbeat is periodic (one a second) and every call goes through
+   `isEnabledFor`, so a quiet level costs an attribute check, and the test suite asserts that 90 frames
+   at `info` produce *no* per-frame lines.
+3. **`tools/profile_loop.py` + the measurement below.** Per-stage milliseconds for one frame (capture,
+   flip, BGR→RGB, MediaPipe, output, preview), mean/median/p95 and share, with the mouse intercepted and
+   replayed at the current position so nothing moves; `--cprofile N` adds the top-N cumulative
+   functions. This is the tool that turns "should we optimise X?" into a number.
+
+| stage | calls/frame | mean ms | share |
+| --- | --- | --- | --- |
+| capture (`read()`) | 1.72 | 0.003 | 0.0% |
+| flip | 1.00 | 0.217 | 1.4% |
+| rgb | 1.00 | 0.177 | 1.2% |
+| MediaPipe | 1.00 | 6.901 | 45.8% |
+| output (one move event) | 0.66 | 11.664 | 50.8% |
+| logic (landmarks, mapping, filter, gestures) | — | 0.108 | 0.7% |
+| **frame** | 1.00 | **15.055** | 100% |
+
+Measured 2026-10-11 with the real camera at 1280x720, real MediaPipe, unpaused, no preview, 90 frames:
+**29.58 processed fps** at a **33.8 ms frame interval**, so the loop is *camera-bound* (interval = 2.2×
+the work). With `--mouse-pause 0.1` (pyautogui's own default) `output` is 108.6 ms per move, the loop
+falls to **8.47 fps** and the verdict flips to *work-bound* — the case `move_max_hz` exists for.
+
+**Two optimisations were measured and rejected in the same pass**, which is the point of having the
+table:
+
+| candidate | measurement | verdict |
+| --- | --- | --- |
+| feed MediaPipe a smaller frame (or capture smaller) | `hands.process` = 8.04 ms at 1280x720, 7.83 at 640x360, 7.86 at 480x270, 7.80 at 320x240 | **rejected** — the cost is flat in input size (it resizes to its own 256x256 internally), so pre-resizing adds work rather than removing it |
+| bypass pyautogui's public API and call `_pyautogui_osx._moveTo` | 11.36 ms (`pyautogui.moveTo`) vs 11.12 ms (the platform hook) | **rejected** — the 11 ms is macOS's event cost, not pyautogui's Python; a 2% saving is not worth coupling the adapter to a private OS backend |
+
+### Packaging (Phase 9, finished 2026-10-11)
+
+`pyproject.toml` declares the project (setuptools, `requires-python >=3.9`, the four runtime
+dependencies with `mediapipe==0.10.14` pinned for the reason in gotcha 8.2) and one console script:
+
+```toml
+[project.scripts]
+kinematic = "kinematic.main:main"
+```
+
+Both invocation styles stay supported on purpose (`python3 -m kinematic.main` and the `kinematic`
+command resolve to the same `main`, and that is why the `__package__` guard at the top of `main.py`
+must stay — gotcha 8.1). Verified by building the wheel rather than by installing it into the running
+interpreter (the project has no venv by design):
+
+```
+~/.local/bin/python3.11 -m pip wheel . --no-deps --no-build-isolation -w <scratch>
+→ kinematic-0.9.0-py3-none-any.whl (70 KB), entry_points.txt: kinematic = kinematic.main:main
+```
+
+The build is done with a *different* interpreter (3.11 + setuptools 84) because the project's 3.9
+interpreter has setuptools 58, which predates PEP 621 `[project]` metadata — so the metadata is
+validated without touching the 3.9 environment at all. `tests/test_phase9_e2e.py` also parses
+`pyproject.toml` and asserts the console-script target, the mediapipe pin and the packaged module list,
+so a broken manifest fails the suite. `build/`, `dist/` and `*.egg-info/` are ignored so a wheel build
+cannot dirty the repo.
+
 ### Phase status — which phases are actually implemented (audited 2026-10-10)
 
 **Phases 1, 2, 3 and 4 are complete (5/5 each).** Before Phase 1 this repo was a prototype that drove
@@ -668,8 +855,8 @@ updated since.
 | 6 — Left & right clicks | ✅ **5/5 (2026-10-11)** | Left click, right click (thumb–middle), shared cooldown, release-then-re-arm, **scroll precedence** — all in the recogniser, whose 72 tests assert exact click counts and whose 32 new recording-adapter tests (`test_phase6_clicks.py`) pin the counts per tap, the cooldown drop, re-arm, pause/tracking-loss suppression and the HUD readout; **suppressed while paused** (Phase 1's `can_emit` gate and the recogniser's own `PAUSED` state, including a pinch held across a resume); **last-action status** on the preview (`show_last_action`, `last_action`, `summary()["actions"]`), which doubles as the readout for the manual click verification procedure in the README; the legacy path is still reachable via `--gesture-engine legacy` and now uses the shared `gesture.is_pinch(..., metric="l1")` instead of a second inline copy of the metric; measured in the real loop: 5 clicks / 5 taps left, 5 right, 0 clicks + 5 scrolls for the two-finger pose | Hovering a click's target is still not tracked (the phase's optional extra); the legacy engine's one-or-two-clicks-per-tap behaviour is unchanged by design |
 | 7 — Two-finger scroll | ✅ **5/5 (2026-10-11)** | Two-finger (index+middle) pose with the midpoint as reference, reference reset on entry, **per-axis dead zone**, configurable `scroll_gain` (vertical) and `scroll_horizontal_gain` (horizontal, `0` = the pre-Phase-7 behaviour of dropping the sideways component), `scroll_invert_vertical`/`scroll_invert_horizontal`, **both wheel axes emitted** (`output.scroll` + `output.hscroll`, distinguished by `MouseEvent.axis`), **click suppression while scrolling** (the pose scrolls instead of clicking), and a `scroll_max_hz` cap that **accumulates** held frames instead of dropping them → distance preserved; measured in the real loop: a vertical sweep −174 units with 0 sideways events, horizontal +174 with 0 vertical, diagonal both, 0 clicks; 42 new tests | The *content* direction of a positive macOS horizontal wheel value is inherited from Quartz and is not verifiable without scrolling the user's screen — hence `scroll_invert_horizontal`; the **legacy** index-finger scroll path is unchanged (still non-conforming: it never had hold/hysteresis or the two-finger reference) |
 | 8 — Pause/runtime/feedback | 🟡 **4/5 + 1 partial** | `runtime.py` coordinator; configurable keyboard toggle (`toggle_pause_keys`) with paused startup; PAUSED/ACTIVE **and the live gesture state** on the preview (`f"… fps  {gesture_state}"`); the recogniser's `PAUSED`/`TRACKING_LOST` states, kept in step by `_sync_gesture_pause()` and the no-hand branch; exception-safe teardown (`try/finally`) | The optional *gesture* pause, and tests for toggle idempotence, recovery and window-close cleanup |
-| 9 — Calibration/hardening | ⛔ **0/5 + 1 partial** | `HandMouseConfig` with the tunables this phase asks for — camera, margins, smoothing, pinch thresholds, cooldown, hotkeys (`toggle_pause_keys`/`quit_keys`/the dial's key tuples) and sensitivity, now adjustable at **runtime** via the dial (`set_sensitivity`/`adjust_sensitivity`, `]`/`[`/`0`, `--sensitivity`, `--sensitivity-step`); **mirroring is a config field now** (`preview_flip` / `--preview-flip`, 2026-10-11) | Diagnostics, logging (0 hits), profiling, packaging (`pyproject.toml`), final setup docs, and the settings-do-not-persist gap: the dial's value is per-session (pass `--sensitivity` to pin it) |
-| Tests | 373 passing | gesture helpers; config defaults; cursor-move guard; camera error path; the Phase 1 safety suite; the pointer-reference suite; the landmark suite; the Phase 3 geometry and smoothing suites; the Phase 4 recogniser suite (54 cases) and runtime suite (18 cases); the Phase 6 click suite (32 cases); the move-rate-limit suite (25 cases); the Phase 7 scroll suite (42 cases: per-axis dead zone, both axes through the recording adapter, sign/gain/inversion maths, the accumulating rate cap, the sweep harness's verdict); the preview-orientation suite (18 cases: all four flip modes, and the skeleton landing on the hand in each); the sensitivity-dial suite (38 cases); the pointer-modes suite (21 cases); the smoothness suite (15 cases) | MediaPipe's own detections, the real camera path, the legacy click/scroll branches beyond the pinned cases, and the on-screen *direction* of a horizontal wheel event |
+| 9 — Calibration/hardening | ✅ **5/5 (2026-10-11)** | `HandMouseConfig` with the tunables this phase asks for — camera, margins, smoothing, pinch thresholds, cooldown, hotkeys (`toggle_pause_keys`/`quit_keys`/the dial's key tuples) and sensitivity, now adjustable at **runtime** via the dial (`set_sensitivity`/`adjust_sensitivity`, `]`/`[`/`0`, `--sensitivity`, `--sensitivity-step`); **mirroring is a config field now** (`preview_flip` / `--preview-flip`, 2026-10-11) | **Configuration/calibration** (all of it: camera, mirroring, margins, smoothing, pinch thresholds, cooldown, sensitivity, hotkeys — with the dial adjustable at *runtime*); **`diagnostics.py` + `--diagnose`** (camera, screen, MediaPipe, Accessibility, configuration; read-only; the denial path diagnosed in-app); **`log.py` + `--log-level`/`--log-file`** (JSON lines, named events, silent by default, no per-frame cost); **`tools/profile_loop.py`** + the measured stage table and the two *rejected* optimisations (§2 "Diagnostics, logging and profiling"); **`pyproject.toml`** with the `kinematic` console script, verified by building the wheel; the README's setup section and **final macOS verification checklist**. 99 new tests: `test_phase8_runtime.py` (31), `test_phase9_diagnostics.py` (31), `test_phase9_logging.py` (18), `test_phase9_e2e.py` (19) | One honest gap and one deliberate one: **the dial's value is per-session** (no settings file — pass `--sensitivity` to pin it), and the hardware-dependent half of the checklist is manual on purpose, because the suite must never touch the desktop. Also still open from earlier phases: no CI, and the legacy engine's non-conforming scroll path |
+| Tests | 487 passing | gesture helpers; config defaults; cursor-move guard; camera error path; the Phase 1 safety suite; the pointer-reference suite; the landmark suite; the Phase 3 geometry and smoothing suites; the Phase 4 recogniser suite (54 cases + 8 press-and-hold cases) and runtime suite (18 cases); the Phase 6 click suite (32 cases + 6 press-and-hold-through-the-adapter cases); the move-rate-limit suite (25 cases); the Phase 7 scroll suite (42 cases: per-axis dead zone, both axes through the recording adapter, sign/gain/inversion maths, the accumulating rate cap, the sweep harness's verdict); the preview-orientation suite (18 cases: all four flip modes, and the skeleton landing on the hand in each); the sensitivity-dial suite (38 cases); the pointer-modes suite (21 cases); the smoothness suite (15 cases); the Phase 8 suite (31 cases: the gesture pause and the teardown guarantees); the Phase 9 diagnostics suite (31 cases, incl. the `--diagnose` CLI path) and logging suite (18 cases); the Phase 9 end-to-end suite (19 cases: denied permissions, unavailable camera, low light, partial tracking, sustained gestures, repeated launch, a call-by-call scripted session) | MediaPipe's own detections, the real camera path, the legacy click/scroll branches beyond the pinned cases, the on-screen *direction* of a horizontal wheel event, and the hardware half of the README's final checklist (a camera negotiating frames, a real hand, the OS obeying a move) — all manual by design |
 
 **What this means for the next session:**
 
@@ -976,7 +1163,11 @@ deliberate taps, 0 clicks for a flicker shorter than the hold time, the cooldown
 deferring a click, release-and-re-pinch, scroll precedence with and without a neutral frame, pause and
 tracking-loss suppression, the HUD line's pixels and text), plus the real loop with the mouse
 intercepted: `--synthetic-pinch left|right` → 5 clicks for 5 taps, `--synthetic-pinch two_finger` → 0
-clicks and 5 scrolls, and the legacy engine's 6 clicks for 5 taps as the documented contrast.
+clicks, and the legacy engine's 6 clicks for 5 taps as the documented contrast. (At the time this line
+was written `two_finger` also reported 5 scrolls; since Phase 7's per-axis dead zone the tap pattern's
+midpoint movement no longer clears the dead zone inside a 6-frame tap, so that variant now reports 0
+whole scroll units — it is a click-suppression check, and `--synthetic-scroll` is what covers the
+scroll path. Verified identical before and after the press-and-hold change.)
 
 - Convert gesture transitions into one-shot left/right click events.
 - Prevent repeated clicks during sustained pinches.
@@ -1068,8 +1259,52 @@ idempotence, immediate suppression, recovery, and cleanup.
 
 ### Phase 9 — Calibration and hardening
 
-**Status: ⛔ 0/5 + 1 partial.** Only the config surface exists, and it is short of this phase's list
-(no mirroring, margins, sensitivity or hotkey fields). No diagnostics, logging, profiling or packaging.
+**Status: ✅ 5/5 complete (2026-10-11).** All five bullets landed, each with the evidence the phase
+asks for:
+
+- **Configuration for camera, mirroring, control margins, smoothing, pinch thresholds, cooldown,
+  sensitivity and hotkeys.** Every one is a field on `HandMouseConfig` with a comment saying what it
+  does and where its default came from; the tunables that are numeric defaults are justified by a
+  measurement quoted in §2, and the ones that decide *behaviour* (mirroring, sensitivity) are
+  adjustable at runtime (`preview_flip`/`--preview-flip`; the sensitivity dial's keys and
+  `set_sensitivity`).
+- **Diagnostics** (`kinematic/diagnostics.py`, `--diagnose`): platform/interpreter, MediaPipe import
+  *and* a frame through the legacy `solutions.hands` API, the output adapter, the screen size, the
+  macOS Accessibility grant (a read-only `AXIsProcessTrusted()` question, never a test move), the
+  effective configuration, and an optional camera probe reporting resolution, first-frame latency,
+  brightness and whether a hand was in view. Denials are diagnosed with their own hints and the exit
+  status is 0 only when everything passed. The app also reports a missing Accessibility grant at
+  startup when the adapter is real (gotcha 8.5).
+- **Structured logging and performance metrics** (`kinematic/log.py`, `--log-level`, `--log-file`): one
+  JSON object per line with named events (`loop_start`/`loop_stop`/`loop_error`, `pause`/`resume` with
+  their source, `tracking_lost`/`tracking_restored`, `click`, `scroll`, `window_closed`, the exit
+  `summary`, and debug-only `frame`/`move`), silent at the default `warning` level, no per-frame cost
+  on the hot path, and a `NullHandler` so a library import prints nothing (gotcha 8.19).
+- **Profiling and reducing unnecessary work** (`tools/profile_loop.py`): the per-stage breakdown
+  (capture / flip / rgb / MediaPipe / output / preview, mean-median-p95 and share), a `--cprofile` mode
+  and the verdict line that says whether the loop is camera-bound or work-bound. Measured here: 15.06 ms
+  of work in a 33.8 ms frame → 29.58 fps, i.e. **camera-bound**; our own logic is 0.108 ms/frame. The
+  two optimisations it was built to test were **measured and rejected** (MediaPipe's cost is flat in
+  input size; `_pyautogui_osx._moveTo` saves 0.24 ms of 11.36) — see §2 "Diagnostics, logging and
+  profiling", which is also where the slow-adapter case (108.6 ms/move → 8.47 fps) is recorded.
+- **Packaging and final setup documentation.** `pyproject.toml` (setuptools, `requires-python >=3.9`,
+  the pinned dependencies, the `kinematic` console script) plus the README's setup section, its
+  diagnostics/logging/profiling sections, and a **final macOS verification checklist** covering fresh
+  setup, both permissions, the dry-run pipeline, every gesture, the gesture pause, logging, packaging
+  and repeated launch/cleanup. The wheel is built with a separate interpreter to verify the metadata
+  without installing into the 3.9 environment.
+
+**Verification evidence** for the phase's own bar ("fresh setup, denied permissions, unavailable
+cameras, low light, partial tracking, sustained gestures, repeated launch/cleanup, full regression
+checks"): `tests/test_phase9_e2e.py` (19 cases) walks exactly that list with injected probes — a denied
+camera and a missing index get their own check failures, a dark frame is flagged while the pipeline
+stays silent, a three-landmark (partial) detection is ignored rather than acted on, 30 taps give 30
+clicks with no drift, three launch/close cycles leave no capture thread, and one scripted session is
+replayed call by call (both wheel axes, no click after scrolling begins, every move on screen, the
+tracking loss noticed). `tests/test_phase9_diagnostics.py` (31) and `tests/test_phase9_logging.py` (18)
+cover the checks and the log, including the `--diagnose` CLI exit status and the absence of per-frame
+lines at `info`. The remaining half of the checklist needs hardware and stays manual by design — the
+suite must never move the user's cursor.
 
 - Add configuration for camera, mirroring, control margins, smoothing, pinch thresholds, cooldown,
   sensitivity, and hotkeys.
@@ -1194,8 +1429,13 @@ Before reporting a phase complete:
       --synthetic-hand --active --sweep-reach 30 --reach-dwell 12`; a change to `move_max_hz` or to the
       move path also gets `--rate-sweep`.
 - [ ] Anything touching the click/scroll path is checked with `python3 tools/measure_loop.py
-      --synthetic-hand --active --synthetic-pinch left|right|two_finger --frames 150`: the tool's verdict
-      line must read `pass - one click per deliberate tap` (or 0 clicks + scrolls for the two-finger pose).
+      --synthetic-hand --active --synthetic-pinch left|right|two_finger --frames 150`: the left/right
+      verdict line must read `pass - one click per deliberate tap`, and the run must not print
+      `button state     : WARNING` (that line means presses and releases did not balance, i.e. a real
+      button left down). The `two_finger` variant of *this* command is a click-suppression check only —
+      it reads `0 clicks` and, since Phase 7's per-axis dead zone, **0 whole scroll units** too, because
+      a 6-frame tap never moves the two-finger midpoint past the dead zone. That is expected, not a
+      failure: use `--synthetic-scroll` (next line) to check the scroll path itself.
 - [ ] A change to the scroll path is checked with `python3 tools/measure_loop.py --synthetic-hand
       --active --synthetic-scroll vertical|horizontal|diagonal --frames 150`, where the verdict line must
       read `pass` with the expected sign on the expected axis (and 0 events on the other one).
@@ -1371,3 +1611,49 @@ config field (`preview_flip`) that decides both halves together (`preview.displa
 at a known asymmetric world position, and the readout text is drawn *after* the flip so it is never
 mirrored. When something on screen looks backwards, check what frame each layer is in before flipping
 individual ones.
+
+**8.18 A test hand's scale constant is part of its geometry, and a "release" pose inside the
+hysteresis band silently stops the next click.** A synthetic hand is only as good as the constant you
+compute its distances with. In `test_phase9_e2e.py` a hand whose wrist is at (0.50, 0.60) and whose
+middle knuckle is at (0.50, 0.45) has a `hand_scale` of **0.15**, and the file's first version said
+`SCALE = 0.10` (copied from the phase-8 file, where the geometry had been *designed* to be 0.10). Every
+ratio was therefore 1.5× off: the pose meant as "released, 0.70" was really 0.47, which is above the
+0.40 engage threshold but **below the 0.56 release threshold** — so the pair stayed engaged, `_armed`
+stayed False, and the second tap of a 30-tap script never clicked (a suite that reported `1 != 30`).
+The tell was in the numbers, not the code: the ratio printout showed 0.47 where the test intended 0.70.
+When a fixture builds geometry by hand, derive the constant from the coordinates or assert it — a
+pose-based test is otherwise testing the arithmetic of its own fixture.
+
+**8.19 A library that logs has to install a `NullHandler`, or `logging.lastResort` prints bare event
+names.** With no handler anywhere in the chain, Python routes `WARNING` and above through
+`logging.lastResort`, a `StreamHandler` at `WARNING` on stderr that prints only the *message* — so this
+project's `log_event(logger, "loop_error", ...)` appeared in the middle of a test run as the single word
+`loop_error`, with none of its fields and no JSON. Every library that logs should install a
+`NullHandler` on its own logger at import (which is what `kinematic/log.py` now does), and an
+application should call `configure()` — which replaces handlers, so the `NullHandler` does not swallow
+the real output. If a structured log ever shows a bare event name instead of a JSON object, the handler
+is missing rather than the formatting being wrong.
+
+**8.20 A single-call "click" cannot represent "hold", and a release must not be gated by the
+debounce rules that gate the press.** `pyautogui.click()` (and this project's `MouseOutput.click()`)
+is a `mouseDown()` immediately followed by a `mouseUp()`. There is no way to make that call "take
+longer" and get a held button out of it — `duration=` exists on `moveTo`, not `click` — so a gesture
+meant to support holding *and* dragging needs the down and the up as two separate adapter calls, with
+the up tied to the gesture's own release. The second half is the subtle one: if the up is routed
+through the same hold-time/cooldown/`require_neutral_between` rules that decide when a down may fire
+(the obvious, tidy implementation), then any state-machine quirk that delays or blocks the "leaving the
+gesture" transition leaves a **real button stuck down on the user's desktop** — a much worse failure
+than the missing feature. Tie the release to the raw per-pair engagement flag and let it bypass the
+gates; a press is debounced, a release is not. See §2 "Pinch press-and-hold: hold to drag".
+
+**8.21 A harness that stubs "the calls the code makes" quietly stops stubbing when the code changes.**
+`tools/measure_loop.py` and `tools/profile_loop.py` both replace pyautogui's `moveTo`/`click`/`scroll`/
+`hscroll` with counters so they can run the real pipeline ("mouse intercepted, nothing moves"). Adding
+`mouseDown`/`mouseUp` to the click path did not raise anywhere — those harnesses simply stopped seeing
+the clicks (their verdicts read `0 clicks for 5 taps`) **while really pressing the user's mouse button**,
+because an unpatched `mouseDown` is a real `mouseDown`. Two lessons: when a stub list enumerates the
+methods the adapter can call, enumerate them from the *adapter's interface* (`MouseOutput`), not from the
+call sites you happen to know about — and make the harness assert its own coverage (the click verdict
+going from `pass` to `0 clicks` was the tell; a `presses != releases` warning is the stuck-button tell).
+Stubbing the adapter *class* rather than the third-party module would have made this impossible.
+

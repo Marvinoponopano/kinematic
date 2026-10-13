@@ -639,5 +639,96 @@ class DeterminismTests(unittest.TestCase):
         self.assertGreater(fired.count("scroll"), 0, "the drift must produce scroll events")
 
 
+class PressAndHoldTests(unittest.TestCase):
+    """A pinch presses and holds the button; it releases only when the pinch itself releases.
+
+    This is the bug fix: ``pyautogui.click()`` is an instant down+up, so a held pinch after the old
+    one-shot ``LEFT_CLICK`` never kept the real button down (reported: "it activates left click, then
+    immediately releases"). The recogniser now fires ``LEFT_CLICK``/``RIGHT_CLICK`` as a press and a
+    matching ``LEFT_RELEASE``/``RIGHT_RELEASE`` when the pose actually opens — tying the release to the
+    raw ``_engaged`` flag, not to the hold/cooldown/neutral-between machinery that gates the press, so
+    a release can never be blocked by those debounce rules.
+    """
+
+    def test_holding_the_pinch_keeps_the_button_down_with_no_extra_events(self):
+        recogniser = GestureRecognizer()
+        update, now = settle(recogniser, hand(thumb_index_ratio=PINCHED), start=0.0)
+        self.assertEqual(kinds(update.events), ["left_click"])
+        self.assertTrue(recogniser.pressed("thumb_index"))
+
+        # Hold for a full second (30+ frames): the button must stay down with nothing re-fired.
+        for index in range(1, 31):
+            held = recogniser.update(Observation(hand(thumb_index_ratio=PINCHED), now + index * FRAME))
+            self.assertEqual(held.events, (), "a held pinch must not re-click or re-press")
+        self.assertTrue(recogniser.pressed("thumb_index"), "the button must still be down")
+
+    def test_releasing_the_pinch_fires_the_release(self):
+        recogniser = GestureRecognizer()
+        _update, now = settle(recogniser, hand(thumb_index_ratio=PINCHED), start=0.0)
+        released = recogniser.update(Observation(hand(thumb_index_ratio=OPEN), now + FRAME))
+        self.assertEqual(kinds(released.events), ["left_release"])
+        self.assertFalse(recogniser.pressed("thumb_index"))
+
+    def test_a_right_pinch_presses_and_releases_the_right_button(self):
+        recogniser = GestureRecognizer()
+        _update, now = settle(recogniser, hand(thumb_middle_ratio=PINCHED), start=0.0)
+        self.assertTrue(recogniser.pressed("thumb_middle"))
+        released = recogniser.update(Observation(hand(thumb_middle_ratio=OPEN), now + FRAME))
+        self.assertEqual(kinds(released.events), ["right_release"])
+        self.assertFalse(recogniser.pressed("thumb_middle"))
+
+    def test_a_quick_tap_still_presses_and_releases_right_away(self):
+        """A fast pinch-and-release looks exactly like the old one-shot click: down then up."""
+        recogniser = GestureRecognizer()
+        update, now = settle(recogniser, hand(thumb_index_ratio=PINCHED), start=0.0)
+        self.assertEqual(kinds(update.events), ["left_click"])
+        released = recogniser.update(Observation(hand(thumb_index_ratio=OPEN), now + FRAME))
+        self.assertEqual(kinds(released.events), ["left_release"])
+
+    def test_release_is_not_blocked_by_cooldown(self):
+        """The 0.18 s cooldown gates the next *press*; it must never hold a release hostage."""
+        recogniser = GestureRecognizer()
+        update, now = settle(recogniser, hand(thumb_index_ratio=PINCHED), start=0.0)
+        self.assertEqual(kinds(update.events), ["left_click"])
+        # Release well inside the cooldown window (0.18 s).
+        released = recogniser.update(Observation(hand(thumb_index_ratio=OPEN), now + 0.02))
+        self.assertEqual(kinds(released.events), ["left_release"])
+
+    def test_pausing_mid_hold_releases_the_button(self):
+        """A pause must never leave the real mouse button stuck down."""
+        recogniser = GestureRecognizer()
+        settle(recogniser, hand(thumb_index_ratio=PINCHED), start=0.0)
+        self.assertTrue(recogniser.pressed("thumb_index"))
+        events = recogniser.set_paused(True)
+        self.assertIn(EventKind.LEFT_RELEASE, [event.kind for event in events])
+        self.assertFalse(recogniser.pressed("thumb_index"))
+
+    def test_tracking_loss_mid_hold_releases_the_button(self):
+        """Losing the hand mid-drag must also release, not strand the button down."""
+        recogniser = GestureRecognizer()
+        _update, now = settle(recogniser, hand(thumb_index_ratio=PINCHED), start=0.0)
+        lost = recogniser.update(Observation(landmarks=None, timestamp=now + FRAME))
+        self.assertIn("left_release", kinds(lost.events))
+        self.assertFalse(recogniser.pressed("thumb_index"))
+
+    def test_resuming_with_the_pinch_already_held_does_not_press_again(self):
+        """A pinch held across a pause/resume is consumed, exactly like the old one-shot click."""
+        recogniser = GestureRecognizer()
+        settle(recogniser, hand(thumb_index_ratio=PINCHED), start=0.0)
+        recogniser.set_paused(True)
+        recogniser.set_paused(False)
+        update = recogniser.update(Observation(hand(thumb_index_ratio=PINCHED), timestamp=1.0))
+        self.assertEqual(update.events, (), "the rising edge belonged to the paused period")
+        self.assertFalse(recogniser.pressed("thumb_index"), "nothing was actually pressed this time")
+
+    def test_pending_releases_does_not_mutate_state(self):
+        recogniser = GestureRecognizer()
+        settle(recogniser, hand(thumb_index_ratio=PINCHED), start=0.0)
+        first = recogniser.pending_releases()
+        second = recogniser.pending_releases()
+        self.assertEqual(first, second)
+        self.assertTrue(recogniser.pressed("thumb_index"), "merely asking must not release anything")
+
+
 if __name__ == "__main__":
     unittest.main()

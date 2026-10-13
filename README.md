@@ -11,29 +11,54 @@ cannot drag it.
 
 Per-phase implementation status and the nine-phase roadmap (foundation/safety, capture, geometry,
 gesture state machine, cursor, clicks, scroll, pause/runtime, calibration) are documented in
-[`AGENTS.md`](AGENTS.md) — see §2 "Phase status" for what is actually implemented today. Phases 1–7
-are complete.
+[`AGENTS.md`](AGENTS.md) — see §2 "Phase status" for what is actually implemented today. **All nine
+phases are implemented.** The parts that need real hardware — a camera negotiating frames, a hand in
+front of it, the OS obeying a cursor move — are verified by the manual checklist near the end of this
+file rather than in the suite, because the suite must never touch your desktop.
 
-The pointer path is tuned by measurement rather than by feel: **355 tests**, and
+The pointer path is tuned by measurement rather than by feel: **487 tests**, and
 `python3 tools/measure_smoothness.py` reports how often the cursor holds still, how large each step is
 and how far it trails your hand — no camera or mouse required.
 
+Before the first run, ask the app what it can see:
+
+```bash
+python3 -m kinematic.main --diagnose      # camera, screen, MediaPipe, permissions: one report, no window
+```
+
 ## Features
 - Cursor control from the wrist/palm (finger articulation cannot move the pointer)
-- Left click on a thumb–index pinch, right click on a thumb–middle pinch
+- Left click on a thumb–index pinch, right click on a thumb–middle pinch — **held for as long as you
+  hold the pinch, so you can drag** (a quick pinch-and-release is an ordinary click)
 - Two-finger scroll — up/down **and sideways** — with a per-axis dead zone, gains, direction switches
   and click suppression
 - Hysteresis, hold times, cooldowns and release-to-re-arm, so a gesture fires exactly once
 - A last-action readout on the preview, so you can see what was clicked without watching your desktop
 - Optional caps on cursor moves and scroll events (`--move-max-hz`, `--scroll-max-hz`, off by default);
   a held-back scroll is accumulated, never dropped
+- Optional **gesture pause**: hold an open hand for a second to pause or resume (`--gesture-pause`)
 - Paused startup, a keyboard pause toggle, `--dry-run`, and a mock output adapter for tests
+- `--diagnose` (camera, screen, MediaPipe, Accessibility), `--log-level` / `--log-file` for a JSON-lines
+  session log, and a `kinematic` console script once installed
 - OpenCV + MediaPipe pipeline with One Euro smoothing to reduce jitter
 
 ## Setup
 
 ```bash
-python3 -m pip install -r requirements.txt
+python3 -m venv .venv && source .venv/bin/activate     # optional but recommended
+python3 -m pip install -r requirements.txt             # or: python3 -m pip install -e .
+```
+
+`pip install -e .` (or `pip install .`) additionally gives you the `kinematic` command, which is the
+same entry point as `python3 -m kinematic.main`. Both invocation styles are supported on purpose. The
+only hard pin is `mediapipe==0.10.14` — 0.10.30 and later removed the `mp.solutions.hands` API this
+pipeline uses, so a newer release installs cleanly and then cannot find a hand tracker.
+
+Then check the machine and the permissions before anything touches the mouse:
+
+```bash
+python3 -m kinematic.main --diagnose                   # all checks; opens the camera once
+python3 -m kinematic.main --diagnose --no-camera-probe # skip the only check that turns on the light
 ```
 
 ## Run
@@ -134,8 +159,8 @@ means one thing, and a pose must persist before it acts.
 
 | Pose | What happens |
 | --- | --- |
-| thumb and index fingertip together | **left click** |
-| thumb and middle fingertip together (index away) | **right click** |
+| thumb and index fingertip together | **left button** — press on the pinch, release when you open it (a quick pinch-and-release is an ordinary left click; **hold the pinch to drag**) |
+| thumb and middle fingertip together (index away) | **right button** — same press/release behaviour |
 | thumb touching both index and middle tips | **scroll** — up/down *and* sideways from the two-finger midpoint |
 | no hand in the frame | tracking lost: nothing is emitted, and a pinch held through the loss must be released and re-pinched |
 | any pose while paused | nothing, including a pinch that was already held when you resumed |
@@ -146,6 +171,10 @@ The rules, so a gesture cannot fire twice or fire by accident:
 - Two clicks are never closer than **0.18 s** (`click_cooldown_seconds`), and the pinch must be
   **released** above the release threshold before it can fire again. A click inside the cooldown is
   dropped, not deferred.
+- The button stays **down** for as long as the pinch is held, and comes **up** the moment it opens —
+  including if you pause, the hand leaves the frame, or a tracking loss happens mid-drag. The hold time
+  and cooldown rules decide when a *press* is allowed to fire; they never delay a release, so a button
+  cannot be left stuck down.
 - **Hysteresis**: a pinch engages below 0.40 of your hand's size and only releases above 0.56, so a hand
   resting near the threshold cannot chatter.
 - Thresholds are **relative to hand size** (`hand_scale`, wrist → middle knuckle), so the same pose works
@@ -303,6 +332,30 @@ positions — and it applies to **cursor moves only**, never to clicks or scroll
 python3 -m kinematic.main --move-max-hz 10     # cap cursor moves at 10 per second
 ```
 
+## Gesture pause (off by default)
+
+`--gesture-pause` lets a *pose* change the pause state, so you do not have to reach for the keyboard
+mid-gesture. Hold an **open hand** — all four fingers straight, no pinch engaged — for
+`gesture_pause_hold_seconds` (1.2 s by default) and it toggles, exactly like `SPACE`:
+
+```bash
+python3 -m kinematic.main --gesture-pause                       # hold an open hand to pause/resume
+python3 -m kinematic.main --gesture-pause --gesture-pause-hold 2
+```
+
+- **One toggle per hold.** After it fires, the pose is disarmed until you take your hand out of it, so a
+  long hold cannot flip the state back and forth.
+- **It works while paused**, which is what lets the same pose resume — the only thing besides the
+  keyboard that does.
+- **Nothing is emitted by it**: a gesture pause never clicks or scrolls, and it is not a mouse action, so
+  `--dry-run` shows it changing the HUD's `PAUSED`/`ACTIVE` and nothing else.
+- **Off by default on purpose.** A pose that can freeze the pointer has to be a deliberate choice: the
+  hand passes through open shapes constantly on its way to a pinch, and a brief stretch must not stop the
+  mouse. The hold time is what keeps that safe; 1.2 s is long enough that only an intentional hold acts.
+
+If you press `SPACE` while already holding the pose, the in-flight hold is cancelled rather than allowed
+to toggle straight back a moment later.
+
 ## Pointing
 
 The cursor is driven by your **wrist/palm**, not your fingertip, and by default it follows the hand's
@@ -386,7 +439,111 @@ on `HandMouseConfig`, so it can be tuned without touching the loop:
 | `scroll_deadzone_ratio` | `0.05` | per-axis dead zone, in hand widths (sub-threshold movement accumulates) |
 | `scroll_max_hz` | `0.0` | cap on scroll events per second; 0 = uncapped; held-back amounts accumulate |
 | `show_last_action` | `True` | draw the last click/scroll, its age and its session count on the preview |
+| `gesture_pause_enabled` | `False` | hold an open hand to pause/resume (`--gesture-pause`); see the section above |
+| `gesture_pause_fingers` | `4` | how many of the four fingers must be straight for that pose |
+| `gesture_pause_hold_seconds` | `1.2` | how long the open hand must be held before it toggles |
+| `log_level` | `"warning"` | JSON-lines log level (`--log-level`); the pipeline speaks at info/debug, so the default prints nothing |
+| `log_file` | `""` | where the log goes: a path appends to it, empty means stderr |
 | `capture_width` / `capture_height` / `capture_fps` / `capture_buffer_size` | 1280 / 720 / 30 / 1 | what is requested from the camera |
+
+## Diagnostics
+
+`--diagnose` answers "why does nothing move?" without opening a window or touching the pointer: it
+checks the platform and interpreter, that MediaPipe imports *and* runs a frame through the legacy
+`solutions.hands` API, which output adapter this run would use, the screen size, the macOS
+Accessibility grant, the effective configuration, and — unless `--no-camera-probe` — that the camera
+opens and delivers a frame:
+
+```bash
+python3 -m kinematic.main --diagnose
+python3 -m kinematic.main --diagnose --no-camera-probe    # skips the only hardware check
+```
+
+```
+camera         FAIL  could not open index 0: OpenCV: not authorized to capture video
+               -> macOS has not granted Camera access to this process. Camera access: System Settings
+                  -> Privacy & Security -> Camera -> enable your Terminal/IDE.
+```
+
+The exit status is 0 when every check passes, so it can gate a script. A permission problem and a
+camera that simply is not there get *different* hints on purpose. The Accessibility check is a
+read-only question to the OS (`AXIsProcessTrusted`), never a test move of the pointer, and the camera
+probe reports what it saw — resolution, how long the first frame took, the mean brightness (`very dark`
+gets its own hint) and whether a hand was in view.
+
+The app also makes this check at startup when it is driving the real pointer, so a missing
+Accessibility grant is reported as a sentence rather than as "the cursor does not move".
+
+## Logging
+
+A session can write a structured log, one JSON object per line, for diffing, plotting or filing a bug
+report. Nothing is written unless you ask: the pipeline speaks at `info`/`debug` and the default level is
+`warning`, so an ordinary run prints its banner and nothing else.
+
+```bash
+python3 -m kinematic.main --log-level info                    # to stderr
+python3 -m kinematic.main --log-level info --log-file run.jsonl
+```
+
+```json
+{"time": 1760272471.502, "level": "info", "logger": "kinematic.runtime", "event": "click", "kind": "left", "action": "left click"}
+{"time": 1760272473.115, "level": "info", "logger": "kinematic.runtime", "event": "pause", "source": "key", "frames": 61}
+{"time": 1760272475.802, "level": "error", "logger": "kinematic.runtime", "event": "loop_error", "error": "RuntimeError('Unable to read frames from the webcam.')", "frames": 92}
+```
+
+The event names are the API: `session_start`, `loop_start`, `loop_stop`, `loop_error`, `pause`,
+`resume`, `tracking_lost`, `tracking_restored`, `click`, `scroll`, `window_closed`, `summary` (the
+session's frames, emitted calls, pause counters and tracking losses) and — at `debug` only — `frame`
+(one heartbeat a second, not one per frame) and `move`. That last split is deliberate: the loop is
+camera-bound and logging must not become the second thing it waits on, so per-frame lines are dropped at
+any level below `debug` and the per-call guard is an attribute check.
+
+## Profiling the loop
+
+`tools/profile_loop.py` prints where a frame's milliseconds actually go — with every mouse call
+intercepted and replayed at the current position, so nothing on the desktop moves:
+
+```bash
+python3 tools/profile_loop.py --active                      # real camera, real MediaPipe
+python3 tools/profile_loop.py --synthetic-hand --active     # no camera either
+python3 tools/profile_loop.py --active --preview             # adds the preview's own cost
+python3 tools/profile_loop.py --active --mouse-pause 0.1     # what a slow adapter costs
+python3 tools/profile_loop.py --synthetic-hand --cprofile 20 # top 20 cumulative functions
+```
+
+Measured on this machine (FaceTime camera at 1280x720, 90 frames, unpaused, no preview — **one run**;
+MediaPipe alone varies by ±30% between runs, so treat the split between MediaPipe and `output` as
+indicative and the frame total as the number to compare like with like):
+
+| stage | calls/frame | mean ms | share | what it is |
+| --- | --- | --- | --- | --- |
+| capture | 1.72 | 0.003 | 0.0% | `read()` handing back the newest frame (the waiting is on the capture thread) |
+| flip | 1.00 | 0.217 | 1.4% | the mirror `cv2.flip` |
+| rgb | 1.00 | 0.177 | 1.2% | BGR→RGB for MediaPipe |
+| mediapipe | 1.00 | 6.901 | 45.8% | hand detection |
+| output | 0.66 | 11.664 | 50.8% | the macOS cursor-move event (11.7 ms each) |
+| logic | — | 0.108 | 0.7% | landmarks, mapping, filter, gestures, bookkeeping |
+| **frame** | 1.00 | **15.055** | 100% | the whole per-frame pipeline |
+
+with **29.58 processed frames/second** and a **33.8 ms frame interval** — so this loop is *camera-bound*
+(the interval is 2.2× the work) and the frame arrival rate, not the pipeline, sets the speed. Adding
+`--preview` costs about **3.4 ms more per iteration** here (≈1.7 ms drawing at `preview_scale 0.5` plus
+≈1.7 ms in `imshow`, with the window's first frame dominating the mean — the medians are much lower).
+Two optimisations were measured and **rejected** in the same pass, which is the point of having the
+numbers:
+
+- **Feeding MediaPipe a smaller frame saves nothing.** `hands.process` costs the same at 1280x720 (8.04
+  ms) as at 640x360 (7.83), 480x270 (7.86) or 320x240 (7.80) — it resizes to its own 256x256 internally.
+  Pre-resizing would add work, not remove it.
+- **Bypassing pyautogui's own API saves nothing either.** `pyautogui.moveTo` (11.36 ms) and its
+  platform hook `_pyautogui_osx._moveTo` (11.12 ms) are the same event: the cost is macOS's, not
+  pyautogui's Python, so reaching into a private hook would buy 2% and couple the adapter to the OS
+  backend.
+
+The slow-adapter case, for comparison (`--active --mouse-pause 0.1`, which is pyautogui's *own*
+default): `output` goes to 108.6 ms per move, the loop drops to **8.47 fps** and the verdict flips to
+*work-bound* — that is the case the `--move-max-hz` cap exists for (see
+[Cursor move rate limit](#cursor-move-rate-limit-off-by-default)).
 
 ## Verifying clicks and scrolling (5 minutes)
 
@@ -451,6 +608,69 @@ The same checks apply, with the HUD counting them, plus the one that matters mos
 deliberate pinch**, and a scroll that follows the hand. `SPACE` pauses, `ESC`/`q` quits, and `Ctrl-C` in
 the terminal always works.
 
+## Final macOS verification checklist
+
+Everything below is what "it works on this machine" means, end to end. The suite covers the logic (487
+tests, no camera, no mouse); this list covers the parts that need the hardware and the OS.
+
+**Fresh setup**
+
+- [ ] Python 3.9+ available; `python3 -m pip install -r requirements.txt` (or `pip install -e .`) succeeds.
+- [ ] `mediapipe` is 0.10.14 (or ≤ 0.10.21): `python3 -c "import mediapipe as mp; print(mp.__version__)"`.
+- [ ] `python3 -m kinematic.main --diagnose --no-camera-probe` reports `ok` for platform, mediapipe,
+      output, screen and configuration.
+
+**Permissions**
+
+- [ ] Camera granted to the host process (Terminal/IDE) — `--diagnose` shows the camera check passing,
+      with a resolution and a brightness.
+- [ ] Accessibility granted — `--diagnose` shows `accessibility  ok  granted to this process`.
+- [ ] Denial is diagnosed, not guessed: revoke Accessibility and confirm the startup line names it and
+      `--diagnose` exits non-zero.
+
+**Pipeline (nothing on the desktop moves)**
+
+- [ ] `python3 -m kinematic.main --dry-run` starts **paused** and emits nothing; `SPACE` switches it to
+      `ACTIVE` in the HUD; `ESC`/`q` quits; the terminal returns to a prompt with no traceback.
+- [ ] `python3 -m unittest discover -s tests` → 487 tests, `OK`.
+- [ ] `python3 tools/measure_loop.py --synthetic-hand --active --frames 150` → 5 clicks / 5 taps.
+- [ ] `python3 tools/measure_smoothness.py` and `tools/profile_loop.py --synthetic-hand --active` run
+      with no camera attached.
+
+**Gestures (dry run first, then live over a harmless window)**
+
+- [ ] Left click: thumb + index pinch held ~0.2 s → exactly one `left click` per deliberate pinch.
+- [ ] Right click: thumb + middle pinch → one `right click`.
+- [ ] Scroll: two fingers down/up → page follows (hand down = page down); left/right → sideways; the pose
+      never clicks. Flip `--invert-scroll-vertical` / `--invert-scroll-horizontal` if a direction feels
+      backwards; `--no-horizontal-scroll` turns sideways off.
+- [ ] Reach: every screen edge and corner is reachable with the hand *stopped* there; the sensitivity
+      dial (`]` / `[` / `0`) is drawn and turning it does not move the cursor by itself.
+- [ ] Finger curl does not move the cursor: open and close your hand and watch the HUD's cursor position.
+- [ ] Pause suppression: pinching or scrolling while `PAUSED` emits nothing, and a pose held across the
+      resume does not fire.
+- [ ] Tracking: take your hand out of frame and back — the cursor re-anchors (it does not glide or jump
+      from stale state) and the HUD reports `tracking_lost` then `neutral`.
+- [ ] Movement: press `SPACE` with a hand in frame and confirm the loop rate in the HUD stays ~30 fps.
+
+**The optional gesture pause**
+
+- [ ] `python3 -m kinematic.main --gesture-pause --dry-run` → holding an open hand for 1.2 s toggles
+      `PAUSED`/`ACTIVE`; a brief open hand on the way to a pinch does *not*.
+
+**Logging and packaging**
+
+- [ ] `--log-level info` prints one JSON object per line to stderr; `--log-file run.jsonl` writes the
+      same lines to a file; `python3 -c "import json;[json.loads(l) for l in open('run.jsonl')]"` parses.
+- [ ] `python3 -m pip install -e .` (in a venv) gives a working `kinematic` command.
+- [ ] Launch, quit and relaunch five times in a row: the preview closes each time, no camera stays busy,
+      and no Python process is left behind.
+
+**Repeatability**
+
+- [ ] Run each scripted harness twice and compare: the numbers should be reproducible (seeded synthetic
+      hands, no camera), which is what makes a "before/after" claim checkable.
+
 ## Requirements
 
 - macOS (tested) or Linux, with a webcam.
@@ -479,7 +699,7 @@ move.
 python3 -m unittest discover -s tests
 ```
 
-Run from the repository root (the tests import `kinematic.gesture`). **373 tests**, none of which can
+Run from the repository root (the tests import `kinematic.gesture`). **487 tests**, none of which can
 touch your mouse, camera or display: they inject a recording output adapter, fake landmarks and fake
 timestamps. They cover the pure gesture geometry, the capture/control loop, the Phase 1 safety layer
 (paused startup, no output while paused, adapters, keys), the landmark conversion and preview drawing
@@ -488,7 +708,11 @@ components, the pointer reference (finger curl must not move the cursor), the ge
 relative thresholds, hysteresis, hold time, cooldown and re-arm, finger distinction, scroll priority,
 tracking loss and pause — the click path through the recording adapter (exact counts per tap, cooldown,
 re-arm, suppression, the last-action readout), the move rate limiter/coalescer
-(`test_move_rate_limit.py`) and the scroll path on both wheel axes (`test_phase7_scroll.py`).
+(`test_move_rate_limit.py`), the scroll path on both wheel axes (`test_phase7_scroll.py`), the gesture
+pause and the teardown guarantees (`test_phase8_runtime.py`), the diagnostics and the JSON log
+(`test_phase9_diagnostics.py`, `test_phase9_logging.py`), and the end-to-end regression suite
+(`test_phase9_e2e.py`: denied permissions, unavailable cameras, low light, partial tracking, sustained
+gestures, repeated launch/cleanup, and a call-by-call replay of a scripted session).
 
 ## Project context
 
