@@ -22,6 +22,7 @@ from .capture import ThreadedCamera
 from .config import HandMouseConfig
 from .landmarks import HandLandmarks, hands_from_results
 from .preview import display_frame, draw_hands, landmark_flip
+from .hud import HudPanel, check_style, draw_control_region, draw_hand_oled, draw_paused_banner, draw_status_panel
 from .gesture import (
     clamp,
     clamp_point,
@@ -748,6 +749,8 @@ class HandMouseRuntime:
         are mirrored again (see :mod:`kinematic.preview`). Text is drawn *after* the flip, so the
         readout is never mirrored.
         """
+        if check_style(self.config.hud_style) == "oled":
+            return self.draw_oled_preview(frame, camera)
         preview = display_frame(frame, self.config.preview_flip)
         if self.config.preview_scale != 1.0:
             preview = cv2.resize(preview, None, fx=self.config.preview_scale, fy=self.config.preview_scale)
@@ -824,6 +827,57 @@ class HandMouseRuntime:
                 1,
                 cv2.LINE_AA,
             )
+        return preview
+
+    def draw_oled_preview(self, frame: np.ndarray, camera: Optional[Any] = None) -> np.ndarray:
+        """The "oled" HUD (see :mod:`kinematic.hud`): same data and orientation rules, the site's look.
+
+        Same contract as the classic path: the landmarks are mirrored to the display orientation, and
+        every text element is drawn after the flip, so nothing readable is ever mirrored.
+        """
+        preview = display_frame(frame, self.config.preview_flip)
+        if self.config.preview_scale != 1.0:
+            preview = cv2.resize(preview, None, fx=self.config.preview_scale, fy=self.config.preview_scale)
+        else:
+            preview = preview.copy()
+        flip = landmark_flip(self.config.preview_flip)
+
+        if self.config.show_control_region and self.config.pointer_mode == "absolute":
+            draw_control_region(preview, self.frame_region, flip=flip)
+        if self.config.show_landmarks:
+            for hand in self.current_hands:
+                draw_hand_oled(preview, hand, flip=flip, gesture=self.gesture_state.value)
+
+        fps_line = None
+        if self.config.show_fps:
+            fps_line = f"{self.loop_fps:4.1f} fps"
+            width, height = getattr(camera, "width", 0), getattr(camera, "height", 0)
+            if width and height:
+                fps_line += f"  {width}x{height}"
+        position = 0.0
+        if self.config.show_sensitivity:
+            low = float(self.config.sensitivity_min)
+            high = max(float(self.config.sensitivity_max), low * 1.01)
+            value = min(max(self.sensitivity, low), high)
+            position = (math.log(value) - math.log(low)) / (math.log(high) - math.log(low))
+        draw_status_panel(
+            preview,
+            HudPanel(
+                paused=self.paused,
+                fps_line=fps_line,
+                gesture=self.gesture_state.value if self.config.show_fps else None,
+                sensitivity=self.sensitivity if self.config.show_sensitivity else None,
+                sensitivity_position=position,
+                reach_warning=bool(self.config.show_sensitivity and self.reach_warning),
+                last_action=(
+                    self.last_action_text()
+                    if self.config.show_last_action and self.last_action is not None
+                    else None
+                ),
+            ),
+        )
+        if self.paused:
+            draw_paused_banner(preview)
         return preview
 
     # -- loop -----------------------------------------------------------------

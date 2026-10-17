@@ -322,7 +322,7 @@ class DialIsDrawnOnThePreviewTests(unittest.TestCase):
     """The dial has to be visible, or you cannot tell where it is set."""
 
     def preview(self, **overrides: Any) -> np.ndarray:
-        runtime = make_runtime(RecordingMouseOutput(), preview_scale=1.0, show_fps=False, **overrides)
+        runtime = make_runtime(RecordingMouseOutput(), preview_scale=1.0, show_fps=False, hud_style="classic", **overrides)
         frame = np.zeros((240, 640, 3), dtype=np.uint8)
         return runtime.draw_preview(frame)
 
@@ -336,7 +336,9 @@ class DialIsDrawnOnThePreviewTests(unittest.TestCase):
         self.assertFalse((frame != 0).any(), "no overlay, no pixels")
 
     def test_the_fps_line_keeps_the_first_row_and_the_dial_follows_it(self):
-        runtime = make_runtime(RecordingMouseOutput(), preview_scale=1.0, show_fps=True, show_sensitivity=True)
+        runtime = make_runtime(
+            RecordingMouseOutput(), preview_scale=1.0, show_fps=True, show_sensitivity=True, hud_style="classic"
+        )
         frame = np.zeros((240, 640, 3), dtype=np.uint8)
         drawn = runtime.draw_preview(frame)
         self.assertTrue((drawn[14:24, :, :] != 0).any(), "fps/gesture line")

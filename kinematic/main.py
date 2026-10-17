@@ -101,6 +101,13 @@ def parse_args(argv: Optional[list] = None) -> argparse.Namespace:
         "selfie shows and the view the pointer follows), none (exactly what the camera delivers), "
         "vertical or both (camera mounted upside down)",
     )
+    parser.add_argument(
+        "--hud-style",
+        choices=("oled", "classic"),
+        default=None,
+        help="the preview's look: oled (default, the landing page's dark style) or classic (the "
+        "original coloured text lines)",
+    )
     parser.add_argument("--camera", type=int, default=None, help="camera index to open (default: 0)")
     parser.add_argument(
         "--pointer-mode",
@@ -216,6 +223,8 @@ def build_config(args: argparse.Namespace) -> HandMouseConfig:
         overrides["show_preview"] = False
     if args.preview_flip is not None:
         overrides["preview_flip"] = args.preview_flip
+    if args.hud_style is not None:
+        overrides["hud_style"] = args.hud_style
     if args.camera is not None:
         overrides["camera_index"] = args.camera
     if args.pointer_mode is not None:

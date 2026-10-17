@@ -349,6 +349,7 @@ class LastActionStatusTests(unittest.TestCase):
     """Phase 6's fifth bullet: the preview says what the last click/scroll was."""
 
     def preview(self, runtime: HandMouseRuntime) -> np.ndarray:
+        runtime.config.hud_style = "classic"  # these rows are the classic layout; see test_oled_hud.py
         return runtime.draw_preview(np.zeros((240, 640, 3), dtype=np.uint8))
 
     def test_a_fresh_session_has_nothing_to_report(self):

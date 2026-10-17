@@ -167,6 +167,8 @@ class PreviewWiringTests(unittest.TestCase):
             "show_landmarks": False,
             # Unpaused: the PAUSED banner is red text, which the skeleton mask below would count.
             "start_paused": False,
+            # The masks below are the classic skeleton's colours; the oled HUD has its own tests.
+            "hud_style": "classic",
         }
         config.update(overrides)
         runtime = HandMouseRuntime(

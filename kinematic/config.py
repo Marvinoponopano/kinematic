@@ -48,6 +48,14 @@ class HandMouseConfig:
     show_preview: bool = True
     show_fps: bool = True
     show_landmarks: bool = True
+    hud_style: str = "oled"
+    #   The preview's look (added 2026-10-16). "oled" (default) carries the landing page's Dark OLED
+    #   style into the window: a translucent black status panel, teal for live and amber for paused or
+    #   pressed, a drawn sensitivity bar, a glowing skeleton and the control region (kinematic/hud.py).
+    #   "classic" is the original coloured text lines, unchanged. Change it with --hud-style.
+    show_control_region: bool = True
+    #   oled HUD, absolute pointer mode: draw the frame region that maps onto the whole screen
+    #   (frame_margin) as a dashed rectangle, so it is visible where the hand has to stay.
 
     # --- safety (Phase 1) ---------------------------------------------------
     # The app starts paused: frames are analysed and previewed, but nothing is sent

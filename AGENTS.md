@@ -43,6 +43,7 @@ kinematic/
 │   ├── mapping.py         # Region + map_point_to_screen (frame region -> screen region)
 │   ├── output.py          # MouseOutput adapters: RealMouseOutput / RecordingMouseOutput (mock)
 │   ├── preview.py         # landmark skeleton drawing for the debug preview (drawn with cv2, no protobuf)
+│   ├── hud.py             # the "oled" preview HUD: the landing page's Dark OLED look in plain cv2
 │   ├── ratelimit.py       # Phase 5/7: MoveRateLimiter (supersede) + ScrollRateLimiter (accumulate)
 │   ├── log.py             # Phase 9: JSON-lines logging (configure/get_logger/log_event), silent by default
 │   ├── diagnostics.py     # Phase 9: checks for camera, screen, MediaPipe, Accessibility, configuration
@@ -66,6 +67,7 @@ kinematic/
     ├── test_phase7_scroll.py     # 42 cases: per-axis dead zone, signs/gains, inversion, both wheel
     │                            #   axes through the adapter, rate cap fidelity, the sweep harness
     ├── test_preview_orientation.py # 18 cases: the preview flip modes and the skeleton landing on the hand
+    ├── test_oled_hud.py          # 24 cases: the oled HUD's panel rows/colours, spark, region, banner, flips
     ├── test_sensitivity_dial.py  # 38 cases: the pointer-gain dial, its keys, its bar, its wiring
     ├── test_pointer_modes.py     # 21 cases: absolute is the default, every edge reachable, the reach floor
     ├── test_pointer_reference.py # 21 cases: wrist/palm reference, curl must not move the cursor, scroll guard
@@ -107,7 +109,8 @@ python3 -m kinematic.main --smoothing-mode ema         # the pre-Phase-3 fixed-f
 python3 -m kinematic.main --gesture-engine legacy      # the pre-Phase-4 inline pinch/scroll tests
 python3 -m kinematic.main --sensitivity 8              # start the pointer gain somewhere else (dial: ] / [ / 0)
 python3 -m kinematic.main --pointer-mode relative      # the old displacement-based scheme (edges need a sweep)
-python3 -m unittest discover -s tests       # 494 tests, all pass
+python3 -m unittest discover -s tests       # 518 tests, all pass
+python3 -m kinematic.main --dry-run --hud-style classic   # the original text-line HUD (default: oled)
 python3 tools/compare_smoothing.py          # seeded jitter vs lag table for the cursor filters
 python3 tools/gesture_trace.py              # every scripted pose through the recogniser, transition by transition
 python3 tools/measure_loop.py --synthetic-hand --active --fingers-only   # the finger-curl regression demo
@@ -213,6 +216,29 @@ both halves of the rule: `display_frame(frame, mode)` picks the orientation show
 hand; the readout text is drawn *after* the flip so it is never mirrored; the 18 cases in
 `tests/test_preview_orientation.py` pin each mode with a marker-block hand at a known asymmetric world
 position (skeleton centroid within ~3 px of the marker, and >100 px off if the display flip is removed).
+
+### The oled preview HUD (added 2026-10-16)
+
+The preview window now uses the landing page's (`index.html`) Dark OLED style by default:
+`HandMouseConfig.hud_style = "oled"` (`--hud-style`). The renderer is in `kinematic/hud.py`, which is
+pure drawing, like `preview.py`. It draws a translucent black status panel with a teal accent bar
+(amber when paused): status, fps, resolution and gesture on the first row, then the sensitivity dial
+as a drawn log-scale bar, then the last action in amber. The skeleton has soft-white bones,
+teal-ringed joints and glowing teal fingertips, with an amber spark at the contact point of an
+engaged pinch or scroll. `show_control_region` draws the absolute-mode control region as a dashed
+rectangle, and a paused session gets an amber banner at the bottom. **`"classic"` is the original
+text-line overlay, unchanged** (`runtime.draw_preview` branches to `draw_oled_preview` and otherwise
+runs its old body). The classic layout's pixel tests now pin `hud_style="classic"` instead of being
+rewritten. The oled HUD keeps the classic contract: the skeleton lands on the hand in every flip
+mode, text is drawn after the flip, nothing is drawn when every overlay is off, an incomplete hand
+draws nothing, and the input frame is never written to.
+
+**What OpenCV cannot match:** this OpenCV build has no `cv2.freetype`, so the site's Clash Display
+and Satoshi fonts are not available. The HUD uses the Hershey fonts, with letter spacing emulated by
+drawing a character at a time, and the glow is a dim halo drawn under each bright dot rather than a
+blur. **Cost** (`draw_preview`, 1280x720 input at `preview_scale` 0.5, every overlay on, 600 timed
+iterations after 50 warm-up, seed 7): classic 0.236 ms mean / 0.299 ms p95, oled 0.494 ms / 0.560 ms
+(0.554 ms paused). About 0.3 ms extra against a 33.8 ms frame interval, so the loop stays camera-bound.
 
 ### Smoothing and screen mapping (Phase 3, finished 2026-10-10)
 
@@ -874,7 +900,7 @@ The per-phase counts below are the current ones, not that first audit's.
 | 7 — Two-finger scroll | ✅ **5/5 (2026-10-11)** | Two-finger (index+middle) pose with the midpoint as reference, reference reset on entry, **per-axis dead zone**, configurable `scroll_gain` (vertical) and `scroll_horizontal_gain` (horizontal, `0` = the pre-Phase-7 behaviour of dropping the sideways component), `scroll_invert_vertical`/`scroll_invert_horizontal`, **both wheel axes emitted** (`output.scroll` + `output.hscroll`, distinguished by `MouseEvent.axis`), **click suppression while scrolling** (the pose scrolls instead of clicking), and a `scroll_max_hz` cap that **accumulates** held frames instead of dropping them → distance preserved; measured in the real loop: a vertical sweep −174 units with 0 sideways events, horizontal +174 with 0 vertical, diagonal both, 0 clicks; 42 new tests | The *content* direction of a positive macOS horizontal wheel value is inherited from Quartz and is not verifiable without scrolling the user's screen — hence `scroll_invert_horizontal`; the **legacy** index-finger scroll path is unchanged (still non-conforming: it never had hold/hysteresis or the two-finger reference) |
 | 8 — Pause/runtime/feedback | ✅ **5/5 (2026-10-11)** | `runtime.py` coordinator; configurable keyboard toggle (`toggle_pause_keys`) with paused startup; PAUSED/ACTIVE **and the live gesture state** on the preview (`f"… fps  {gesture_state}"`); the recogniser's `PAUSED`/`TRACKING_LOST` states, kept in step by `_sync_gesture_pause()` and the no-hand branch; exception-safe teardown (`try/finally`); **the opt-in gesture pause** (an open hand held `gesture_pause_hold_seconds`, one toggle per hold, released to re-arm, works *while* paused so the same pose resumes, and emits nothing to the desktop — `--gesture-pause`); **window close is a real exit**; **every path that ends the run releases a held button** (`release_held_buttons()` on `run()`'s `finally` and on `close()`, §2 "Pinch press-and-hold") — 37 cases in `test_phase8_runtime.py` cover toggle idempotence, recovery after a failed run, cleanup on exit / window close / exception, three launch/close cycles leaving no capture thread, and the six teardown-release cases | — |
 | 9 — Calibration/hardening | ✅ **5/5 (2026-10-11)** | `HandMouseConfig` with the tunables this phase asks for — camera, margins, smoothing, pinch thresholds, cooldown, hotkeys (`toggle_pause_keys`/`quit_keys`/the dial's key tuples) and sensitivity, now adjustable at **runtime** via the dial (`set_sensitivity`/`adjust_sensitivity`, `]`/`[`/`0`, `--sensitivity`, `--sensitivity-step`); **mirroring is a config field now** (`preview_flip` / `--preview-flip`, 2026-10-11) | **Configuration/calibration** (all of it: camera, mirroring, margins, smoothing, pinch thresholds, cooldown, sensitivity, hotkeys — with the dial adjustable at *runtime*); **`diagnostics.py` + `--diagnose`** (camera, screen, MediaPipe, Accessibility, configuration; read-only; the denial path diagnosed in-app); **`log.py` + `--log-level`/`--log-file`** (JSON lines, named events, silent by default, no per-frame cost); **`tools/profile_loop.py`** + the measured stage table and the two *rejected* optimisations (§2 "Diagnostics, logging and profiling"); **`pyproject.toml`** with the `kinematic` console script, verified by building the wheel; the README's user-facing setup, controls and safety sections, and §7's **manual verification list**. 99 new tests: `test_phase8_runtime.py` (31), `test_phase9_diagnostics.py` (31), `test_phase9_logging.py` (18), `test_phase9_e2e.py` (19) | One honest gap and one deliberate one: **the dial's value is per-session** (no settings file — pass `--sensitivity` to pin it), and the hardware-dependent half of the checklist is manual on purpose, because the suite must never touch the desktop. Also still open from earlier phases: no CI, and the legacy engine's non-conforming scroll path |
-| Tests | 494 passing | gesture helpers; config defaults; cursor-move guard; camera error path; the Phase 1 safety suite; the pointer-reference suite; the landmark suite; the Phase 3 geometry and smoothing suites; the Phase 4 recogniser suite (64 cases: 54 + 10 press-and-hold, incl. a release that fires when engagement ends while paused) and runtime suite (18 cases); the Phase 6 click suite (37 cases, incl. 6 press-and-hold-through-the-adapter cases); the move-rate-limit suite (25 cases); the Phase 7 scroll suite (42 cases: per-axis dead zone, both axes through the recording adapter, sign/gain/inversion maths, the accumulating rate cap, the sweep harness's verdict); the preview-orientation suite (18 cases: all four flip modes, and the skeleton landing on the hand in each); the sensitivity-dial suite (38 cases); the pointer-modes suite (21 cases); the smoothness suite (15 cases); the Phase 8 suite (37 cases: the gesture pause, the teardown guarantees, and six cases proving every exit path lifts a held button); the Phase 9 diagnostics suite (31 cases, incl. the `--diagnose` CLI path) and logging suite (18 cases); the Phase 9 end-to-end suite (19 cases: denied permissions, unavailable camera, low light, partial tracking, sustained gestures, repeated launch, a call-by-call scripted session) | MediaPipe's own detections, the real camera path, the legacy click/scroll branches beyond the pinned cases, the on-screen *direction* of a horizontal wheel event, and the hardware half of §7's manual verification list (a camera negotiating frames, a real hand, the OS obeying a move) — all manual by design |
+| Tests | 518 passing | gesture helpers; config defaults; cursor-move guard; camera error path; the Phase 1 safety suite; the pointer-reference suite; the landmark suite; the Phase 3 geometry and smoothing suites; the Phase 4 recogniser suite (64 cases: 54 + 10 press-and-hold, incl. a release that fires when engagement ends while paused) and runtime suite (18 cases); the Phase 6 click suite (37 cases, incl. 6 press-and-hold-through-the-adapter cases); the move-rate-limit suite (25 cases); the Phase 7 scroll suite (42 cases: per-axis dead zone, both axes through the recording adapter, sign/gain/inversion maths, the accumulating rate cap, the sweep harness's verdict); the preview-orientation suite (18 cases: all four flip modes, and the skeleton landing on the hand in each); the sensitivity-dial suite (38 cases); the pointer-modes suite (21 cases); the smoothness suite (15 cases); the Phase 8 suite (37 cases: the gesture pause, the teardown guarantees, and six cases proving every exit path lifts a held button); the Phase 9 diagnostics suite (31 cases, incl. the `--diagnose` CLI path) and logging suite (18 cases); the Phase 9 end-to-end suite (19 cases: denied permissions, unavailable camera, low light, partial tracking, sustained gestures, repeated launch, a call-by-call scripted session); the oled HUD suite (24 cases) | MediaPipe's own detections, the real camera path, the legacy click/scroll branches beyond the pinned cases, the on-screen *direction* of a horizontal wheel event, and the hardware half of §7's manual verification list (a camera negotiating frames, a real hand, the OS obeying a move) — all manual by design |
 
 **What this means for the next session:**
 
@@ -1517,7 +1543,7 @@ exit non-zero).
 
 **Pipeline, nothing moving on the desktop** — `--dry-run` starts **paused** and emits nothing; `SPACE`
 switches the HUD to `ACTIVE`; `ESC`/`q` quits with no traceback; `python3 -m unittest discover -s tests`
-→ 494 tests `OK`; `tools/measure_loop.py --synthetic-hand --active --frames 150` → 5 clicks / 5 taps;
+→ 518 tests `OK`; `tools/measure_loop.py --synthetic-hand --active --frames 150` → 5 clicks / 5 taps;
 `tools/measure_smoothness.py` and `tools/profile_loop.py --synthetic-hand --active` run with no camera.
 
 **Gestures (dry run first, then live over a harmless window)** — one `left click` per deliberate pinch;

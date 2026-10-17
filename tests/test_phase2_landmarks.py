@@ -161,6 +161,7 @@ class RuntimeUsesTheInternalRepresentationTests(unittest.TestCase):
         runtime.config.show_preview = True
         runtime.config.preview_scale = 0.5
         runtime.config.show_fps = False
+        runtime.config.hud_style = "classic"  # pins the original overlay; the oled HUD has its own tests
         runtime.process_frame(np.zeros((240, 320, 3), dtype=np.uint8))
 
         preview = runtime.draw_preview(np.zeros((240, 320, 3), dtype=np.uint8), camera=None)
@@ -173,6 +174,7 @@ class RuntimeUsesTheInternalRepresentationTests(unittest.TestCase):
         runtime.config.show_preview = True
         runtime.config.preview_scale = 0.5
         runtime.config.show_fps = False
+        runtime.config.hud_style = "classic"  # pins the original overlay; the oled HUD has its own tests
         runtime.config.show_landmarks = False
         runtime.config.show_sensitivity = False  # the dial is its own overlay (added later)
         runtime.process_frame(np.zeros((240, 320, 3), dtype=np.uint8))
