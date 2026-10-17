@@ -1,0 +1,787 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Kinematic — your hand is the mouse</title>
+  <meta name="description" content="Kinematic turns webcam hand landmarks into pointer, click and scroll input on macOS. Starts paused, runs dry, tested without a camera.">
+  <meta name="theme-color" content="#000000">
+  <link rel="icon" href="../assets/logo.svg" type="image/svg+xml">
+  <link rel="preconnect" href="https://api.fontshare.com" crossorigin>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link rel="stylesheet" href="https://api.fontshare.com/v2/css?f[]=clash-display@500,600&f[]=satoshi@400,500,700&display=swap">
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500&display=swap">
+  <style>
+    :root {
+      --black: #000000;
+      --ink: #050607;
+      --surface: #0a0b0d;
+      --line: rgba(255, 255, 255, 0.08);
+      --line-strong: rgba(255, 255, 255, 0.16);
+      --text: #ededea;
+      --muted: #8d9198;
+      --accent: #54d6c7;          /* the logo's teal: the one dominant colour */
+      --accent-soft: rgba(84, 214, 199, 0.14);
+      --accent-glow: rgba(84, 214, 199, 0.45);
+      --amber: #ffb547;           /* the sharp accent: a pressed button, a live state */
+      --amber-glow: rgba(255, 181, 71, 0.5);
+
+      --font-display: "Clash Display", "Satoshi", sans-serif;
+      --font-body: "Satoshi", sans-serif;
+      --font-mono: "JetBrains Mono", ui-monospace, monospace;
+
+      --ease-out: cubic-bezier(0.16, 1, 0.3, 1);
+      --gutter: clamp(1.25rem, 4vw, 3.5rem);
+      --max: 1280px;
+    }
+
+    *, *::before, *::after { box-sizing: border-box; }
+    html { background: var(--black); color-scheme: dark; scroll-behavior: smooth; }
+    body {
+      margin: 0;
+      background: var(--black);
+      color: var(--text);
+      font: 400 1.0625rem/1.65 var(--font-body);
+      -webkit-font-smoothing: antialiased;
+      overflow-x: hidden;
+    }
+    a { color: inherit; }
+    img, svg { display: block; }
+    ::selection { background: var(--accent); color: var(--black); }
+
+    :focus-visible {
+      outline: 2px solid var(--accent);
+      outline-offset: 4px;
+      border-radius: 6px;
+    }
+
+    .skip {
+      position: absolute; left: 1rem; top: -4rem; z-index: 100;
+      background: var(--accent); color: var(--black);
+      padding: 0.6rem 1rem; border-radius: 999px; font-weight: 700; text-decoration: none;
+    }
+    .skip:focus { top: 1rem; }
+
+    .sr-only {
+      position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px;
+      overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; border: 0;
+    }
+
+    /* Velvet grain: one fixed layer over everything, never interactive. */
+    .grain {
+      position: fixed; inset: -50%; z-index: 90; pointer-events: none;
+      opacity: 0.07; mix-blend-mode: overlay;
+      background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='200' height='200'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='3' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
+      animation: grain 1.2s steps(6) infinite;
+    }
+    @keyframes grain {
+      0% { transform: translate(0, 0); } 20% { transform: translate(-3%, 2%); }
+      40% { transform: translate(2%, -4%); } 60% { transform: translate(-4%, -1%); }
+      80% { transform: translate(3%, 3%); } 100% { transform: translate(0, 0); }
+    }
+
+    .wrap { width: min(100% - 2 * var(--gutter), var(--max)); margin-inline: auto; }
+
+    .eyebrow {
+      font: 500 0.75rem/1 var(--font-mono);
+      letter-spacing: 0.18em; text-transform: uppercase; color: var(--muted);
+      display: inline-flex; align-items: center; gap: 0.75rem;
+    }
+    .eyebrow::before {
+      content: ""; width: 2.5rem; height: 1px; background: var(--accent);
+      box-shadow: 0 0 12px var(--accent-glow);
+    }
+
+    kbd {
+      display: inline-grid; place-items: center; min-width: 2.1em; height: 2.1em; padding: 0 0.55em;
+      font: 500 0.8em/1 var(--font-mono); color: var(--text);
+      background: linear-gradient(180deg, #16181b, #0b0c0e);
+      border: 1px solid var(--line-strong); border-bottom-width: 3px; border-radius: 8px;
+    }
+
+    /* ---------- Nav ---------- */
+    .nav {
+      position: sticky; top: 0; z-index: 50;
+      background: linear-gradient(180deg, rgba(0,0,0,0.92), rgba(0,0,0,0));
+      backdrop-filter: blur(8px);
+    }
+    .nav .wrap { display: flex; align-items: center; justify-content: space-between; height: 76px; }
+    .brand { display: flex; align-items: center; gap: 0.8rem; text-decoration: none; }
+    .brand img { width: 34px; height: 34px; border-radius: 9px; }
+    .brand span { font: 600 1.15rem/1 var(--font-display); letter-spacing: 0.02em; }
+    .nav ul { display: flex; gap: 2.25rem; list-style: none; margin: 0; padding: 0; }
+    .nav ul a {
+      text-decoration: none; color: var(--muted); font-size: 0.92rem;
+      transition: color 0.3s var(--ease-out);
+    }
+    .nav ul a:hover { color: var(--text); }
+
+    .btn {
+      display: inline-flex; align-items: center; gap: 0.6rem;
+      padding: 0.85rem 1.4rem; border-radius: 999px;
+      font: 700 0.92rem/1 var(--font-body); text-decoration: none; cursor: pointer;
+      border: 1px solid var(--line-strong); background: transparent; color: var(--text);
+      transition: border-color 0.35s var(--ease-out), box-shadow 0.35s var(--ease-out), transform 0.35s var(--ease-out);
+    }
+    .btn:hover { border-color: var(--accent); box-shadow: 0 0 28px -6px var(--accent-glow); transform: translateY(-1px); }
+    .btn--solid { background: var(--accent); color: var(--black); border-color: var(--accent); }
+    .btn--solid:hover { box-shadow: 0 0 40px -4px var(--accent-glow); }
+
+    /* ---------- Hero ---------- */
+    .hero { position: relative; padding: clamp(3rem, 8vw, 7rem) 0 clamp(4rem, 9vw, 8rem); }
+    .hero::before {
+      /* A single pool of light behind the demo: OLED black everywhere else. */
+      content: ""; position: absolute; z-index: -1;
+      width: 70vw; height: 70vw; right: -22vw; top: -18vw;
+      background: radial-gradient(closest-side, rgba(84, 214, 199, 0.12), transparent 70%);
+    }
+    .hero .wrap {
+      display: grid; grid-template-columns: 1.08fr 0.92fr; gap: clamp(2rem, 5vw, 5rem); align-items: center;
+    }
+    .hero h1 {
+      font: 600 clamp(3.2rem, 8.4vw, 7.6rem)/0.92 var(--font-display);
+      letter-spacing: -0.035em; margin: 1.6rem 0 1.8rem;
+    }
+    .hero h1 em {
+      font-style: normal; color: transparent;
+      -webkit-text-stroke: 1.5px var(--accent);
+      text-shadow: 0 0 40px rgba(84, 214, 199, 0.25);
+    }
+    .hero h1 .line { display: block; overflow: hidden; }
+    .hero h1 .line > span { display: inline-block; animation: rise 1.2s var(--ease-out) both; }
+    .hero h1 .line:nth-child(2) > span { animation-delay: 0.12s; }
+    .hero h1 .line:nth-child(3) > span { animation-delay: 0.24s; }
+    @keyframes rise { from { transform: translateY(105%); } to { transform: translateY(0); } }
+
+    .lede { max-width: 34rem; color: var(--muted); font-size: 1.15rem; margin: 0 0 2.4rem; }
+    .lede strong { color: var(--text); font-weight: 500; }
+    .cta { display: flex; flex-wrap: wrap; gap: 0.9rem; align-items: center; }
+
+    .fade-in { animation: fade 1.4s var(--ease-out) 0.45s both; }
+    @keyframes fade { from { opacity: 0; transform: translateY(14px); } to { opacity: 1; transform: none; } }
+
+    /* The preview frame: modelled on the app's own debug window. */
+    .stage {
+      position: relative; aspect-ratio: 4 / 4.6;
+      border-radius: 28px; border: 1px solid var(--line);
+      background:
+        radial-gradient(120% 80% at 50% 110%, rgba(84, 214, 199, 0.08), transparent 60%),
+        linear-gradient(180deg, #050607, #000);
+      overflow: hidden; outline: none;
+      box-shadow: 0 40px 120px -40px rgba(84, 214, 199, 0.25), inset 0 1px 0 rgba(255,255,255,0.05);
+      transform: rotate(1.5deg) translateY(1rem);
+      animation: stage-in 1.6s var(--ease-out) 0.2s both;
+      touch-action: none;
+    }
+    @keyframes stage-in {
+      from { opacity: 0; transform: rotate(4deg) translateY(3rem) scale(0.96); }
+      to { opacity: 1; transform: rotate(1.5deg) translateY(1rem); }
+    }
+    .stage:focus-visible { box-shadow: 0 0 0 2px var(--accent), 0 40px 120px -40px var(--accent-glow); }
+    .stage svg.hand { position: absolute; inset: 0; width: 100%; height: 100%; }
+    .stage .region {
+      /* the inner 70% of the frame that maps onto the whole screen */
+      position: absolute; inset: 15%; border: 1px dashed rgba(84, 214, 199, 0.22); border-radius: 6px;
+      pointer-events: none;
+    }
+    .stage .region::after {
+      content: "control region · 70%"; position: absolute; left: 0.6rem; bottom: 0.5rem;
+      font: 400 0.62rem/1 var(--font-mono); letter-spacing: 0.12em; color: rgba(84, 214, 199, 0.55);
+      text-transform: uppercase;
+    }
+    .hud {
+      position: absolute; left: 1.1rem; right: 1.1rem; top: 1rem;
+      display: flex; justify-content: space-between; align-items: flex-start; gap: 1rem;
+      font: 500 0.72rem/1.5 var(--font-mono); color: var(--muted);
+    }
+    .hud .state { color: var(--text); }
+    .hud .last { min-height: 1.5em; color: var(--amber); }
+    .pill {
+      display: inline-flex; align-items: center; gap: 0.5rem; cursor: pointer;
+      font: 500 0.7rem/1 var(--font-mono); letter-spacing: 0.12em; text-transform: uppercase;
+      padding: 0.5rem 0.8rem; border-radius: 999px;
+      border: 1px solid var(--line-strong); background: rgba(0,0,0,0.6); color: var(--text);
+    }
+    .pill i { width: 7px; height: 7px; border-radius: 50%; background: var(--muted); }
+    .pill[aria-pressed="true"] i { background: var(--accent); box-shadow: 0 0 10px var(--accent-glow); }
+    .pill[aria-pressed="false"] { color: var(--amber); border-color: rgba(255, 181, 71, 0.4); }
+    .pill[aria-pressed="false"] i { background: var(--amber); }
+    .stage-caption {
+      position: absolute; left: 1.1rem; right: 1.1rem; bottom: 1rem;
+      display: flex; justify-content: space-between; gap: 1rem;
+      font: 400 0.68rem/1.4 var(--font-mono); color: #6c7077;
+    }
+
+    /* ---------- Gestures ---------- */
+    section { position: relative; }
+    .section-pad { padding: clamp(5rem, 10vw, 9rem) 0; }
+    .section-head {
+      display: grid; grid-template-columns: 0.9fr 1.1fr; gap: 2rem; align-items: end;
+      margin-bottom: clamp(3rem, 6vw, 5rem);
+    }
+    h2 {
+      font: 600 clamp(2.4rem, 5.4vw, 4.6rem)/0.98 var(--font-display);
+      letter-spacing: -0.03em; margin: 1.2rem 0 0;
+    }
+    .section-head p { color: var(--muted); max-width: 32rem; margin: 0; justify-self: end; }
+
+    .gestures { list-style: none; margin: 0; padding: 0; border-top: 1px solid var(--line); }
+    .gesture {
+      display: grid; grid-template-columns: 4.5rem 1.2fr 1fr auto; gap: 2rem; align-items: center;
+      padding: 1.8rem 0; border-bottom: 1px solid var(--line);
+      transition: padding 0.5s var(--ease-out), background 0.5s var(--ease-out);
+    }
+    .gesture:nth-child(even) { padding-left: clamp(0rem, 6vw, 6rem); }
+    .gesture:hover, .gesture:focus-within {
+      background: linear-gradient(90deg, var(--accent-soft), transparent 70%);
+    }
+    .gesture .num { font: 400 0.8rem/1 var(--font-mono); color: var(--muted); }
+    .gesture h3 { font: 500 clamp(1.4rem, 2.6vw, 2.1rem)/1.1 var(--font-display); margin: 0; letter-spacing: -0.01em; }
+    .gesture p { margin: 0; color: var(--muted); }
+    .gesture .tag {
+      font: 500 0.72rem/1 var(--font-mono); letter-spacing: 0.1em; text-transform: uppercase;
+      color: var(--accent); border: 1px solid rgba(84, 214, 199, 0.35);
+      padding: 0.55rem 0.8rem; border-radius: 999px; white-space: nowrap;
+    }
+    .gesture .tag--amber { color: var(--amber); border-color: rgba(255, 181, 71, 0.4); }
+    .gesture button {
+      all: unset; cursor: pointer; display: contents;
+    }
+
+    /* ---------- Safety: the diagonal band ---------- */
+    .safety {
+      background: var(--accent); color: var(--black);
+      transform: skewY(-3deg); margin: clamp(2rem, 5vw, 4rem) 0;
+    }
+    .safety .inner { transform: skewY(3deg); padding: clamp(4rem, 8vw, 6.5rem) 0; }
+    .safety .wrap { display: grid; grid-template-columns: 1.2fr 1fr; gap: clamp(2rem, 5vw, 5rem); align-items: center; }
+    .safety h2 { margin: 0; color: var(--black); }
+    .safety p { margin: 0 0 1.6rem; font-size: 1.1rem; max-width: 30rem; }
+    .safety dl { display: grid; grid-template-columns: auto 1fr; gap: 0.9rem 1.2rem; margin: 0; align-items: center; }
+    .safety dt { display: flex; gap: 0.4rem; }
+    .safety dd { margin: 0; font-weight: 500; }
+    .safety kbd {
+      color: var(--black); background: rgba(0,0,0,0.08); border-color: rgba(0,0,0,0.35);
+    }
+
+    /* ---------- Pipeline ---------- */
+    .pipeline { display: grid; grid-template-columns: repeat(5, 1fr); gap: 0; counter-reset: stage; }
+    .pipe {
+      position: relative; padding: 2rem 1.5rem 2.2rem 0; border-top: 1px solid var(--line-strong);
+    }
+    .pipe::before {
+      content: ""; position: absolute; top: -4px; left: 0; width: 7px; height: 7px; border-radius: 50%;
+      background: var(--accent); box-shadow: 0 0 14px var(--accent-glow);
+    }
+    .pipe:nth-child(odd) { margin-top: 3rem; }
+    .pipe .k { font: 400 0.72rem/1 var(--font-mono); letter-spacing: 0.14em; text-transform: uppercase; color: var(--muted); }
+    .pipe h3 { font: 500 1.35rem/1.15 var(--font-display); margin: 0.9rem 0 0.6rem; }
+    .pipe p { margin: 0; color: var(--muted); font-size: 0.95rem; }
+    .pipe code { font: 400 0.82em var(--font-mono); color: var(--text); }
+
+    .stats {
+      display: grid; grid-template-columns: 1.4fr repeat(3, 1fr); margin-top: clamp(3rem, 6vw, 5rem);
+      border: 1px solid var(--line); border-radius: 24px; overflow: hidden;
+    }
+    .stat { padding: 2rem 1.75rem; border-left: 1px solid var(--line); }
+    .stat:first-child { border-left: 0; background: var(--surface); }
+    .stat b {
+      display: block; font: 500 clamp(2.2rem, 4.4vw, 3.6rem)/1 var(--font-display); letter-spacing: -0.03em;
+    }
+    .stat b small { font-size: 0.45em; color: var(--muted); margin-left: 0.2em; letter-spacing: 0; }
+    .stat span { display: block; margin-top: 0.7rem; color: var(--muted); font-size: 0.9rem; }
+    .stat:first-child p { margin: 0; color: var(--muted); font-size: 0.95rem; }
+    .stat:first-child h3 { font: 500 1.3rem/1.2 var(--font-display); margin: 0 0 0.6rem; }
+
+    /* ---------- Install ---------- */
+    .install .wrap { display: grid; grid-template-columns: 0.85fr 1.15fr; gap: clamp(2rem, 6vw, 6rem); align-items: start; }
+    .install p { color: var(--muted); }
+    .term {
+      position: relative; border-radius: 22px; border: 1px solid var(--line);
+      background: var(--ink); overflow: hidden;
+      box-shadow: 0 30px 90px -40px rgba(84, 214, 199, 0.3);
+    }
+    .term header {
+      display: flex; justify-content: space-between; align-items: center;
+      padding: 0.9rem 1.2rem; border-bottom: 1px solid var(--line);
+      font: 400 0.75rem/1 var(--font-mono); color: var(--muted);
+    }
+    .term pre {
+      margin: 0; padding: 1.5rem 1.4rem 1.8rem; overflow-x: auto;
+      font: 400 0.9rem/1.85 var(--font-mono); color: var(--text);
+    }
+    .term .c { color: #5f646b; }
+    .term .p { color: var(--accent); user-select: none; }
+    .copy {
+      all: unset; cursor: pointer; font: 500 0.72rem/1 var(--font-mono); color: var(--muted);
+      padding: 0.45rem 0.7rem; border-radius: 8px; border: 1px solid var(--line);
+    }
+    .copy:hover { color: var(--text); border-color: var(--line-strong); }
+    .copy:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+    .reqs { list-style: none; padding: 0; margin: 2rem 0 0; display: grid; gap: 0.8rem; }
+    .reqs li { display: flex; gap: 0.8rem; align-items: baseline; color: var(--muted); }
+    .reqs li::before { content: "↳"; color: var(--accent); font-family: var(--font-mono); }
+
+    /* ---------- Footer ---------- */
+    footer { border-top: 1px solid var(--line); padding: 3rem 0 4rem; margin-top: clamp(4rem, 8vw, 7rem); }
+    footer .wrap { display: flex; justify-content: space-between; align-items: flex-end; gap: 2rem; flex-wrap: wrap; }
+    .mega {
+      font: 600 clamp(4rem, 17vw, 15rem)/0.8 var(--font-display); letter-spacing: -0.05em;
+      color: transparent; -webkit-text-stroke: 1px rgba(255,255,255,0.14); margin: 0; user-select: none;
+    }
+    footer small { color: var(--muted); font-family: var(--font-mono); font-size: 0.75rem; }
+
+    /* ---------- Cursor halo (fine pointers only; the native cursor stays) ---------- */
+    .halo {
+      position: fixed; left: 0; top: 0; z-index: 80; pointer-events: none;
+      width: 38px; height: 38px; margin: -19px 0 0 -19px; border-radius: 50%;
+      border: 1px solid var(--accent-glow);
+      transition: width 0.25s var(--ease-out), height 0.25s var(--ease-out), margin 0.25s var(--ease-out),
+                  border-color 0.25s, background 0.25s;
+      opacity: 0;
+    }
+    .halo.on { opacity: 1; }
+    .halo.down {
+      width: 14px; height: 14px; margin: -7px 0 0 -7px;
+      border-color: var(--amber); background: var(--amber-glow);
+    }
+    @media (hover: none), (pointer: coarse) { .halo { display: none; } }
+
+    /* ---------- Reveal ---------- */
+    .reveal { opacity: 0; transform: translateY(28px); transition: opacity 1.1s var(--ease-out), transform 1.1s var(--ease-out); }
+    .reveal.in { opacity: 1; transform: none; }
+
+    /* ---------- Responsive ---------- */
+    @media (max-width: 960px) {
+      .nav ul { display: none; }
+      .hero .wrap, .section-head, .safety .wrap, .install .wrap { grid-template-columns: 1fr; }
+      .section-head p { justify-self: start; }
+      .stage { max-width: 520px; transform: none; animation-name: fade; }
+      .pipeline { grid-template-columns: 1fr 1fr; }
+      .pipe:nth-child(odd) { margin-top: 0; }
+      .stats { grid-template-columns: 1fr 1fr; }
+      .stat:first-child { grid-column: 1 / -1; }
+      .stat:nth-child(2) { border-left: 0; }
+      .stat { border-top: 1px solid var(--line); }
+    }
+    @media (max-width: 640px) {
+      .gesture { grid-template-columns: 2.5rem 1fr; gap: 0.6rem 1rem; }
+      .gesture:nth-child(even) { padding-left: 0; }
+      .gesture p, .gesture .tag { grid-column: 2; justify-self: start; }
+      .pipeline { grid-template-columns: 1fr; }
+      .stats { grid-template-columns: 1fr; }
+      .stat { border-left: 0; }
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+      *, *::before, *::after {
+        animation-duration: 0.001ms !important; animation-iteration-count: 1 !important;
+        transition-duration: 0.001ms !important; scroll-behavior: auto !important;
+      }
+      .grain { animation: none; }
+      .reveal { opacity: 1; transform: none; }
+      .halo { display: none; }
+    }
+  </style>
+</head>
+<body>
+  <a class="skip" href="#main">Skip to content</a>
+  <div class="grain" aria-hidden="true"></div>
+  <div class="halo" aria-hidden="true"></div>
+
+  <nav class="nav" aria-label="Primary">
+    <div class="wrap">
+      <a class="brand" href="#top" aria-label="Kinematic, home">
+        <img src="../assets/logo.svg" alt="" width="34" height="34">
+        <span>Kinematic</span>
+      </a>
+      <ul>
+        <li><a href="#gestures">Gestures</a></li>
+        <li><a href="#safety">Safety</a></li>
+        <li><a href="#pipeline">Pipeline</a></li>
+        <li><a href="#install">Install</a></li>
+      </ul>
+      <a class="btn" href="https://github.com/Marvinoponopano/kinematic">
+        GitHub <span aria-hidden="true">↗</span>
+      </a>
+    </div>
+  </nav>
+
+  <main id="main">
+    <!-- ================= HERO ================= -->
+    <header class="hero" id="top">
+      <div class="wrap">
+        <div>
+          <span class="eyebrow">Webcam hand mouse · macOS</span>
+          <h1>
+            <span class="line"><span>Your hand</span></span>
+            <span class="line"><span>is the</span></span>
+            <span class="line"><span><em>mouse.</em></span></span>
+          </h1>
+          <p class="lede fade-in">
+            Kinematic reads 21 hand landmarks from your webcam and turns them into
+            <strong>pointer, click, drag and scroll</strong>. The cursor follows your palm, not a
+            fingertip, so curling a finger never moves it.
+          </p>
+          <div class="cta fade-in">
+            <a class="btn btn--solid" href="#install">Run a dry run <span aria-hidden="true">→</span></a>
+            <a class="btn" href="#gestures">See the gestures</a>
+          </div>
+        </div>
+
+        <figure class="stage" id="stage" tabindex="0" aria-describedby="stage-help" style="margin:0">
+          <svg class="hand" id="hand" viewBox="0 0 400 460" role="img"
+               aria-label="Animated hand skeleton showing the four Kinematic gestures">
+            <defs>
+              <filter id="glow" x="-50%" y="-50%" width="200%" height="200%">
+                <feGaussianBlur stdDeviation="4" result="b"/>
+                <feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge>
+              </filter>
+            </defs>
+            <g id="hand-g"></g>
+          </svg>
+          <div class="region" aria-hidden="true"></div>
+          <div class="hud">
+            <div aria-live="polite">
+              <div><span id="hud-mode">ACTIVE</span> · 30 fps · <span class="state" id="hud-state">neutral</span></div>
+              <div class="last" id="hud-last"></div>
+            </div>
+            <button class="pill" id="pause" type="button" aria-pressed="true">
+              <i aria-hidden="true"></i><span>Active</span>
+            </button>
+          </div>
+          <figcaption class="stage-caption" id="stage-help">
+            <span>Click &amp; hold to pinch · <kbd>Space</kbd> pauses</span>
+            <span>preview / demo</span>
+          </figcaption>
+        </figure>
+      </div>
+    </header>
+
+    <!-- ================= GESTURES ================= -->
+    <section class="section-pad" id="gestures" aria-labelledby="g-title">
+      <div class="wrap">
+        <div class="section-head reveal">
+          <div>
+            <span class="eyebrow">Gesture map</span>
+            <h2 id="g-title">Four poses.<br>One meaning each.</h2>
+          </div>
+          <p>Poses resolve in a fixed priority: scroll first, then left, then right. Thresholds scale
+            with your hand, so a pinch registers the same near the camera as far from it. Hover a row
+            to see the pose in the preview.</p>
+        </div>
+
+        <ol class="gestures reveal">
+          <li class="gesture" data-pose="left">
+            <span class="num">01</span>
+            <h3>Thumb + index</h3>
+            <p>Press and hold the left button. Keep pinching to drag; open to release.</p>
+            <span class="tag">Left click</span>
+          </li>
+          <li class="gesture" data-pose="right">
+            <span class="num">02</span>
+            <h3>Thumb + middle</h3>
+            <p>Press and hold the right button, with the same hold time and cooldown.</p>
+            <span class="tag">Right click</span>
+          </li>
+          <li class="gesture" data-pose="scroll">
+            <span class="num">03</span>
+            <h3>Thumb on both</h3>
+            <p>Move the hand to scroll on both axes. This pose never clicks.</p>
+            <span class="tag">Scroll</span>
+          </li>
+          <li class="gesture" data-pose="open">
+            <span class="num">04</span>
+            <h3>Open hand, held</h3>
+            <p>Opt in with <code>--gesture-pause</code>. Hold the open hand for 1.2 s to pause or resume.</p>
+            <span class="tag tag--amber">Pause</span>
+          </li>
+        </ol>
+      </div>
+    </section>
+
+    <!-- ================= SAFETY ================= -->
+    <section class="safety" id="safety" aria-labelledby="s-title">
+      <div class="inner">
+        <div class="wrap">
+          <div class="reveal">
+            <h2 id="s-title">It starts paused.<br>Always.</h2>
+          </div>
+          <div class="reveal">
+            <p>The app analyses frames from launch but sends nothing to your desktop until you say so.
+              <code>--dry-run</code> swaps in a recording adapter that never touches the real pointer.</p>
+            <dl>
+              <dt><kbd>Space</kbd><kbd>P</kbd></dt><dd>Pause or resume output, instantly</dd>
+              <dt><kbd>Esc</kbd><kbd>Q</kbd></dt><dd>Quit. A held button is released on the way out</dd>
+              <dt><kbd>]</kbd><kbd>[</kbd><kbd>0</kbd></dt><dd>Turn the sensitivity dial live</dd>
+            </dl>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ================= PIPELINE ================= -->
+    <section class="section-pad" id="pipeline" aria-labelledby="p-title">
+      <div class="wrap">
+        <div class="section-head reveal">
+          <div>
+            <span class="eyebrow">Under the hood</span>
+            <h2 id="p-title">Hardware at the edges.<br>Pure logic inside.</h2>
+          </div>
+          <p>The gesture logic takes timestamps as arguments and never sees a camera or a mouse.
+            That is why the whole suite runs without a webcam, a display or a single real click.</p>
+        </div>
+
+        <ol class="pipeline reveal" style="list-style:none;margin:0;padding:0">
+          <li class="pipe">
+            <span class="k">01 · capture</span>
+            <h3>Threaded camera</h3>
+            <p>A background grabber hands over the newest frame, mirrored.</p>
+          </li>
+          <li class="pipe">
+            <span class="k">02 · landmarks</span>
+            <h3>MediaPipe Hands</h3>
+            <p>21 points, converted once at the boundary into plain dataclasses.</p>
+          </li>
+          <li class="pipe">
+            <span class="k">03 · smoothing</span>
+            <h3>One Euro filter</h3>
+            <p>A 4 Hz low-pass on the palm. No grid, no snapping.</p>
+          </li>
+          <li class="pipe">
+            <span class="k">04 · recognise</span>
+            <h3>State machine</h3>
+            <p>Hysteresis, hold time, cooldown and re-arm, in <code>recognizer.py</code>.</p>
+          </li>
+          <li class="pipe">
+            <span class="k">05 · output</span>
+            <h3>Gated adapter</h3>
+            <p>Only the runtime calls it, and only after checking <code>can_emit</code>.</p>
+          </li>
+        </ol>
+
+        <div class="stats reveal">
+          <div class="stat">
+            <h3>Camera-bound, not work-bound</h3>
+            <p>Profiled with <code>tools/profile_loop.py</code> on the development Mac: about 15 ms of
+              work inside a 33.8 ms camera interval.</p>
+          </div>
+          <div class="stat"><b>29.6<small>fps</small></b><span>processed, hand in frame</span></div>
+          <div class="stat"><b>6.9<small>ms</small></b><span>MediaPipe per frame</span></div>
+          <div class="stat"><b>494</b><span>tests, no camera needed</span></div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ================= INSTALL ================= -->
+    <section class="install" id="install" aria-labelledby="i-title">
+      <div class="wrap">
+        <div class="reveal">
+          <span class="eyebrow">Quick start</span>
+          <h2 id="i-title">Ninety seconds to a dry run.</h2>
+          <p>The dry run opens the preview and records what it would have sent, without moving your
+            pointer. Leave out <code>--dry-run</code> for real output; it still starts paused.</p>
+          <ul class="reqs">
+            <li>Python 3.9 or newer, and a webcam</li>
+            <li>macOS Camera permission for your terminal</li>
+            <li>Accessibility permission for real pointer output</li>
+          </ul>
+        </div>
+
+        <div class="term reveal">
+          <header>
+            <span>zsh — kinematic</span>
+            <button class="copy" type="button" id="copy">Copy</button>
+          </header>
+<pre id="cmds"><span class="p">$ </span>git clone https://github.com/Marvinoponopano/kinematic.git
+<span class="p">$ </span>cd kinematic
+<span class="p">$ </span>python3 -m pip install -r requirements.txt
+<span class="p">$ </span>python3 -m kinematic.main --dry-run
+<span class="c"># check camera, screen, MediaPipe and Accessibility</span>
+<span class="p">$ </span>python3 -m kinematic.main --diagnose</pre>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <footer>
+    <div class="wrap">
+      <p class="mega" aria-hidden="true">Kinematic</p>
+      <small>MIT licensed · built with OpenCV, MediaPipe &amp; PyAutoGUI</small>
+    </div>
+  </footer>
+
+  <script>
+  (() => {
+    const reduced = matchMedia("(prefers-reduced-motion: reduce)").matches;
+
+    /* ---------- Hand skeleton: MediaPipe's 21 landmarks and connections ---------- */
+    const OPEN = [
+      [200, 420], [160, 392], [124, 352], [102, 314], [84, 280],   // wrist, thumb
+      [166, 272], [156, 208], [151, 166], [147, 126],              // index
+      [203, 264], [203, 194], [203, 146], [203, 104],              // middle
+      [239, 272], [246, 206], [251, 164], [255, 128],              // ring
+      [272, 292], [290, 242], [300, 208], [308, 176],              // pinky
+    ];
+    const tweak = (edits) => OPEN.map((p, i) => edits[i] || p);
+    const POSES = {
+      open: OPEN,
+      left: tweak({ 3: [112, 324], 4: [128, 292], 6: [150, 226], 7: [136, 258], 8: [130, 290] }),
+      right: tweak({ 2: [140, 352], 3: [148, 320], 4: [180, 292], 10: [200, 214], 11: [190, 256], 12: [182, 288] }),
+      scroll: tweak({ 3: [124, 322], 4: [154, 292], 6: [156, 222], 7: [150, 258], 8: [148, 288],
+                      10: [202, 214], 11: [180, 256], 12: [162, 288] }),
+    };
+    const STATE_NAME = { open: "neutral", left: "left_pinch", right: "right_pinch", scroll: "two_finger_scroll" };
+    const ACTION = { left: "left click", right: "right click", scroll: "scroll" };
+    const CONTACT = { left: [4, 8], right: [4, 12], scroll: [4, 8] };
+    const BONES = [
+      [0,1],[1,2],[2,3],[3,4], [0,5],[5,6],[6,7],[7,8], [5,9],[9,10],[10,11],[11,12],
+      [9,13],[13,14],[14,15],[15,16], [13,17],[0,17],[17,18],[18,19],[19,20],
+    ];
+    const TIPS = new Set([4, 8, 12, 16, 20]);
+
+    const NS = "http://www.w3.org/2000/svg";
+    const g = document.getElementById("hand-g");
+    const mk = (tag, attrs) => {
+      const el = document.createElementNS(NS, tag);
+      for (const k in attrs) el.setAttribute(k, attrs[k]);
+      g.appendChild(el);
+      return el;
+    };
+    const lines = BONES.map(() => mk("line", { stroke: "rgba(237,237,234,0.55)", "stroke-width": 2.2, "stroke-linecap": "round" }));
+    const spark = mk("circle", { r: 0, fill: "#ffb547", filter: "url(#glow)", opacity: 0 });
+    const dots = OPEN.map((_, i) => mk("circle", {
+      r: TIPS.has(i) ? 6.5 : 4.5,
+      fill: TIPS.has(i) ? "#54d6c7" : "#000",
+      stroke: "#54d6c7", "stroke-width": 2,
+      filter: TIPS.has(i) ? "url(#glow)" : "",
+    }));
+
+    let pts = OPEN.map((p) => p.slice());
+    let pose = "open";
+    let offset = [0, 0], target = [0, 0];
+    let active = true, lastAction = null, lastAt = 0, counts = {};
+
+    const hudMode = document.getElementById("hud-mode");
+    const hudState = document.getElementById("hud-state");
+    const hudLast = document.getElementById("hud-last");
+    const pauseBtn = document.getElementById("pause");
+
+    function setPose(next) {
+      if (next === pose) return;
+      pose = next;
+      hudState.textContent = STATE_NAME[pose];
+      if (active && ACTION[pose]) {
+        lastAction = ACTION[pose]; lastAt = performance.now();
+        counts[lastAction] = (counts[lastAction] || 0) + 1;
+      }
+    }
+    function setActive(on) {
+      active = on;
+      pauseBtn.setAttribute("aria-pressed", String(on));
+      pauseBtn.lastElementChild.textContent = on ? "Active" : "Paused";
+      hudMode.textContent = on ? "ACTIVE" : "PAUSED";
+    }
+    pauseBtn.addEventListener("click", () => setActive(!active));
+
+    /* ---------- Idle demo loop; any interaction takes over for a few seconds ---------- */
+    const SCRIPT = [["open", 1600], ["left", 1000], ["open", 1200], ["right", 1000], ["open", 1200], ["scroll", 2000]];
+    let step = 0, stepAt = performance.now(), heldUntil = 0;
+    const takeOver = (ms = 4000) => { heldUntil = performance.now() + ms; };
+
+    const stage = document.getElementById("stage");
+    stage.addEventListener("pointermove", (e) => {
+      const r = stage.getBoundingClientRect();
+      target = [((e.clientX - r.left) / r.width - 0.5) * 120, ((e.clientY - r.top) / r.height - 0.5) * 90];
+      takeOver();
+    });
+    stage.addEventListener("pointerleave", () => { target = [0, 0]; });
+    stage.addEventListener("pointerdown", () => { setPose("left"); takeOver(); });
+    addEventListener("pointerup", () => { if (pose === "left" && performance.now() < heldUntil) setPose("open"); });
+    stage.addEventListener("keydown", (e) => {
+      if (e.key === " " || e.key.toLowerCase() === "p") { e.preventDefault(); setActive(!active); }
+    });
+    document.querySelectorAll(".gesture").forEach((row) => {
+      const show = () => { setPose(row.dataset.pose); takeOver(60000); };
+      row.addEventListener("pointerenter", show);
+      row.addEventListener("pointerleave", () => { setPose("open"); takeOver(1500); });
+    });
+
+    /* ---------- Frame loop: the same idea as the app, a time-constant low-pass ---------- */
+    let prev = performance.now();
+    function frame(now) {
+      const dt = Math.min(0.05, (now - prev) / 1000); prev = now;
+
+      if (!reduced && now > heldUntil && now - stepAt > SCRIPT[step][1]) {
+        step = (step + 1) % SCRIPT.length; stepAt = now; setPose(SCRIPT[step][0]);
+      }
+
+      const aPose = reduced ? 1 : 1 - Math.exp(-dt * 14);
+      const aMove = reduced ? 1 : 1 - Math.exp(-dt * 2 * Math.PI * 4);  // 4 Hz, like the cursor filter
+      const goal = POSES[pose];
+      for (let i = 0; i < pts.length; i++) {
+        pts[i][0] += (goal[i][0] - pts[i][0]) * aPose;
+        pts[i][1] += (goal[i][1] - pts[i][1]) * aPose;
+      }
+      const sway = pose === "scroll" && !reduced ? Math.sin(now / 380) * 26 : 0;
+      offset[0] += (target[0] - offset[0]) * aMove;
+      offset[1] += (target[1] + sway - offset[1]) * aMove;
+      g.setAttribute("transform", `translate(${offset[0].toFixed(1)} ${offset[1].toFixed(1)})`);
+
+      BONES.forEach(([a, b], i) => {
+        lines[i].setAttribute("x1", pts[a][0]); lines[i].setAttribute("y1", pts[a][1]);
+        lines[i].setAttribute("x2", pts[b][0]); lines[i].setAttribute("y2", pts[b][1]);
+      });
+      dots.forEach((d, i) => { d.setAttribute("cx", pts[i][0]); d.setAttribute("cy", pts[i][1]); });
+
+      const c = CONTACT[pose];
+      if (c) {
+        const [p, q] = [pts[c[0]], pts[c[1]]];
+        const close = Math.hypot(p[0] - q[0], p[1] - q[1]) < 16;
+        spark.setAttribute("cx", (p[0] + q[0]) / 2); spark.setAttribute("cy", (p[1] + q[1]) / 2);
+        spark.setAttribute("r", close ? 9 : 0); spark.setAttribute("opacity", close ? 0.9 : 0);
+      } else {
+        spark.setAttribute("opacity", 0);
+      }
+
+      if (lastAction) {
+        const ago = ((now - lastAt) / 1000).toFixed(1);
+        hudLast.textContent = `last: ${lastAction}  ${ago}s ago  (${counts[lastAction]} this session)`;
+      }
+      requestAnimationFrame(frame);
+    }
+    requestAnimationFrame(frame);
+
+    /* ---------- Cursor halo: shrinks to a point on press, like a pinch ---------- */
+    const halo = document.querySelector(".halo");
+    if (!reduced && matchMedia("(pointer: fine)").matches) {
+      addEventListener("pointermove", (e) => {
+        halo.classList.add("on");
+        halo.style.transform = `translate(${e.clientX}px, ${e.clientY}px)`;
+      }, { passive: true });
+      addEventListener("pointerdown", () => halo.classList.add("down"));
+      addEventListener("pointerup", () => halo.classList.remove("down"));
+      document.addEventListener("pointerleave", () => halo.classList.remove("on"));
+    }
+
+    /* ---------- Reveal on scroll ---------- */
+    const io = new IntersectionObserver((entries) => entries.forEach((en) => {
+      if (en.isIntersecting) { en.target.classList.add("in"); io.unobserve(en.target); }
+    }), { threshold: 0.15 });
+    document.querySelectorAll(".reveal").forEach((el) => io.observe(el));
+
+    /* ---------- Copy commands ---------- */
+    const copy = document.getElementById("copy");
+    copy.addEventListener("click", async () => {
+      const text = [...document.querySelectorAll("#cmds")][0].innerText
+        .split("\n").filter((l) => l.startsWith("$ ")).map((l) => l.slice(2)).join("\n");
+      try { await navigator.clipboard.writeText(text); copy.textContent = "Copied"; }
+      catch { copy.textContent = "Select to copy"; }
+      setTimeout(() => (copy.textContent = "Copy"), 1800);
+    });
+  })();
+  </script>
+</body>
+</html>
